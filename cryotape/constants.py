@@ -18,6 +18,10 @@ CRYO_EXTS: frozenset[str] = frozenset({
 # LTO-6 标称容量 2.5 TB，扣除索引与安全缓冲后默认 2.25 TB
 DEFAULT_NEW_TAPE_CAPACITY_GB: float = 2250.0
 DEFAULT_SAFETY_MARGIN_GB: float = 15.0
+# 跨 project 共享磁带空间时的最小剩余阈值
+DEFAULT_MIN_TAIL_GB: float = 100.0
+# 项目完整度优先：True=不跨盘拆分项目；False=默认节省空间优先
+DEFAULT_INTEGRITY_PRIORITY: bool = False
 
 # 默认 LTFS 挂载点与本地 CSV 路径
 DEFAULT_LTFS_MOUNT: str = "/mnt/ltfs"

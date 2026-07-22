@@ -8,8 +8,10 @@ from typing import Optional, Sequence
 
 from .constants import (
     DEFAULT_CSV_CATALOG,
+    DEFAULT_INTEGRITY_PRIORITY,
     DEFAULT_LOG_DIR,
     DEFAULT_LTFS_MOUNT,
+    DEFAULT_MIN_TAIL_GB,
     DEFAULT_NEW_TAPE_CAPACITY_GB,
     DEFAULT_SAFETY_MARGIN_GB,
 )
@@ -42,6 +44,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--new-tape-capacity", type=float,
                    default=DEFAULT_NEW_TAPE_CAPACITY_GB,
                    help="标准空磁带可用容量（GB）")
+    p.add_argument("--min-tail-gb", type=float,
+                   default=DEFAULT_MIN_TAIL_GB,
+                   help="跨项目共享磁带空间时的最小剩余阈值（GB）"
+                        "——剩余超过此值且下一项目能放下时不开新磁带")
+    p.add_argument("--prefer-project-integrity", action="store_true",
+                   default=DEFAULT_INTEGRITY_PRIORITY,
+                   help="项目完整度优先：一个项目只放在一盘磁带上，"
+                        "整体放不下就开新磁带（默认关闭：节省空间优先，"
+                        "放不下时自动拆分 project 跨多盘）")
     p.add_argument("--dry-run", action="store_true",
                    help="预演模式：仅计算与打印摘要，不写入磁带")
     p.add_argument("-v", "--verbose", action="store_true",
@@ -84,6 +95,8 @@ def args_to_config(args: argparse.Namespace) -> RuntimeConfig:
         csv_catalog=Path(args.csv_catalog).expanduser(),
         safety_margin_gb=float(args.safety_margin),
         new_tape_capacity_gb=float(args.new_tape_capacity),
+        min_tail_gb=float(args.min_tail_gb),
+        integrity_priority=bool(args.prefer_project_integrity),
         dry_run=bool(args.dry_run),
         verbose=bool(args.verbose),
         non_interactive=bool(args.non_interactive),

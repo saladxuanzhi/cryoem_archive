@@ -18,10 +18,10 @@ from .exceptions import (
     UserAbortedError,
 )
 from .interactive import RuntimeConfig
-from .packer import TapePacker
+from .packer import GlobalPacker, TapePacker
 from .resume import ResumeHandler
 from .streamer import TarStreamer
-from .types import CapacityPlan, TapePart
+from .types import CapacityPlan, ProjectInfo, TapePart
 from .utils import (
     format_size,
     prompt,
@@ -101,61 +101,140 @@ class Workflow:
     # ---------- 干跑 ----------
     def _dry_run(self, roots: Sequence[Path], cap_plan: CapacityPlan) -> None:
         print("\n========== DRY RUN ==========")
-        for root in roots:
-            project_name = root.name
-            files = FileDiscovery(root).discover()
-            if not files:
-                print(f"\n[!] {project_name}: 没有文件，跳过")
-                continue
-            packer = TapePacker(cap_plan.cap_bytes)
-            try:
-                parts = packer.pack(project_name, files)
-            except OversizedFileError as exc:
-                print(f"\n[!] {project_name}: {exc}")
-                continue
-            total_size = sum(p.capacity_used_bytes for p in parts)
-            print(f"\n📦 {project_name}: {len(files)} 个文件，{format_size(total_size)}，"
-                  f"将分为 {len(parts)} 盘")
-            for p in parts:
+        projects = self._build_projects(roots)
+        if not projects:
+            print("[!] 没有发现任何项目的文件")
+            return
+
+        min_tail_bytes = int(self.config.min_tail_gb * 1000 ** 3)
+        global_packer = GlobalPacker(
+            cap_plan.cap_bytes,
+            min_tail_bytes,
+            integrity_priority=self.config.integrity_priority,
+        )
+        try:
+            parts = global_packer.pack(projects)
+        except OversizedFileError as exc:
+            print(f"\n[!] {exc}")
+            return
+
+        tape_assignment = global_packer.tape_assignment(parts)
+        total_size = sum(p.capacity_used_bytes for p in parts)
+        n_tapes = tape_assignment[-1] if tape_assignment else 0
+        mode = "完整度优先" if self.config.integrity_priority else "节省空间优先"
+
+        print(f"\n[*] 共 {len(projects)} 个项目，总计 {format_size(total_size)}，"
+              f"将分为 {len(parts)} 个 part，写入 {n_tapes} 盘磁带（{mode}）\n")
+
+        # 按 project 分组打印
+        from collections import defaultdict
+        by_project: dict[str, list[tuple[int, TapePart, int]]] = defaultdict(list)
+        for tape_no, part in zip(tape_assignment, parts):
+            by_project[part.project_name].append((tape_no, part, 0))
+
+        for project in projects:
+            proj_parts = by_project.get(project.name, [])
+            proj_total = sum(p.capacity_used_bytes for _, p, _ in proj_parts)
+            print(f"\n📦 {project.name}: {project.file_count} 个文件，"
+                  f"{format_size(proj_total)}，将分为 {len(proj_parts)} 个 part")
+            for tape_no, p, _ in proj_parts:
                 ratio = p.capacity_used_bytes / p.capacity_cap_bytes
-                print(f"  - Part{p.part_index:02d}: {p.file_count} 文件, "
-                      f"{format_size(p.capacity_used_bytes)} "
+                print(f"  - Tape{tape_no:02d} / Part{p.part_index:02d}: "
+                      f"{p.file_count} 文件, {format_size(p.capacity_used_bytes)} "
                       f"({ratio * 100:.1f}% of {format_size(p.capacity_cap_bytes)}), "
                       f"{p.first_file}  ==>  {p.last_file}")
 
+        print("\n" + "-" * 60)
+        print("📼 磁带汇总:")
+        for tape_no in sorted(set(tape_assignment)):
+            tape_parts = [p for n, p in zip(tape_assignment, parts) if n == tape_no]
+            used = sum(p.capacity_used_bytes for p in tape_parts)
+            print(f"  Tape{tape_no:02d}: {len(tape_parts)} 个 part, "
+                  f"总计 {format_size(used)}, "
+                  f"剩余 {format_size(cap_plan.cap_bytes - used)}")
+
     # ---------- 真实写盘 ----------
     def _archive_all(self, roots: Sequence[Path], cap_plan: CapacityPlan) -> None:
-        for root in roots:
-            self._archive_one_project(root, cap_plan)
-
-    def _archive_one_project(self, project_root: Path, cap_plan: CapacityPlan) -> None:
-        project_name = project_root.name
-        parent_dir = project_root.parent
-        files = FileDiscovery(project_root).discover()
-        if not files:
-            print(f"[!] {project_name}: 没有文件，跳过")
+        projects = self._build_projects(roots)
+        if not projects:
+            print("[!] 没有发现任何项目的文件")
             return
 
-        packer = TapePacker(cap_plan.cap_bytes)
+        min_tail_bytes = int(self.config.min_tail_gb * 1000 ** 3)
+        global_packer = GlobalPacker(
+            cap_plan.cap_bytes,
+            min_tail_bytes,
+            integrity_priority=self.config.integrity_priority,
+        )
         try:
-            parts = packer.pack(project_name, files)
+            parts = global_packer.pack(projects)
         except OversizedFileError as exc:
-            print(f"[X] {project_name}: {exc}")
+            print(f"[X] {exc}")
             return
 
-        print(f"\n[*] 项目 {project_name}: {len(parts)} 盘，{len(files)} 个文件，"
-              f"{format_size(sum(p.capacity_used_bytes for p in parts))}")
+        tape_assignment = global_packer.tape_assignment(parts)
+        n_tapes = tape_assignment[-1] if tape_assignment else 0
+        total_size = sum(p.capacity_used_bytes for p in parts)
+        print(f"\n[*] 共 {len(projects)} 个项目，总计 {format_size(total_size)}，"
+              f"将分为 {len(parts)} 个 part，写入 {n_tapes} 盘磁带")
+
+        # 跟踪当前磁带已用空间
+        current_tape_used = 0
+        current_tape_idx = tape_assignment[0] if tape_assignment else 0
 
         for i, part in enumerate(parts):
+            target_tape_idx = tape_assignment[i]
+            # 检测是否需要换磁带
+            if target_tape_idx != current_tape_idx:
+                # 换磁带
+                self._prompt_tape_swap(current_tape_idx, target_tape_idx)
+                current_tape_idx = target_tape_idx
+                current_tape_used = 0
+
+            # 找到 project 的 parent_dir
+            parent_dir = next(p.parent_dir for p in projects if p.name == part.project_name)
+
             self._write_one_part(
                 part=part,
                 parent_dir=parent_dir,
                 cap_plan=cap_plan,
                 is_last_part=(i == len(parts) - 1),
+                tape_idx=target_tape_idx,
+                current_tape_used=current_tape_used,
             )
+            current_tape_used += part.capacity_used_bytes
+
+    def _build_projects(self, roots: Sequence[Path]) -> list[ProjectInfo]:
+        """为每个 project root 构建 ProjectInfo（含已排序的文件列表）。"""
+        projects: list[ProjectInfo] = []
+        for root in roots:
+            files = FileDiscovery(root).discover()
+            if not files:
+                print(f"[!] {root.name}: 没有文件，跳过")
+                continue
+            projects.append(ProjectInfo(
+                name=root.name,
+                root=root,
+                parent_dir=root.parent,
+                files=files,
+            ))
+        return projects
+
+    def _prompt_tape_swap(self, current_tape: int, next_tape: int) -> None:
+        """提示用户插入新磁带。"""
+        print(f"\n[!] === 磁带切换 ===")
+        print(f"    即将写入 Tape{next_tape:02d}，请弹出当前 Tape{current_tape:02d}")
+        print(f"    执行: umount {self.config.ltfs_mount}")
+        print(f"    换上新的空磁带（或已写入部分数据的磁带），重新挂载 LTFS")
+        if not prompt("准备好后按 [Enter] 继续",
+                      default_yes=self.config.yes,
+                      non_interactive=self.config.non_interactive):
+            raise UserAbortedError("用户在换带时取消")
 
     def _write_one_part(self, *, part: TapePart, parent_dir: Path,
-                        cap_plan: CapacityPlan, is_last_part: bool) -> None:
+                        cap_plan: CapacityPlan, is_last_part: bool,
+                        tape_idx: int = 0,
+                        current_tape_used: int = 0) -> None:
         """处理单盘的完整生命周期：摘要→确认→Manifest→tar→盘内CSV→本地CSV。"""
         mount = self.config.ltfs_mount
         archive_path = mount / part.archive_name
@@ -164,14 +243,16 @@ class Workflow:
         log_path = self.config.log_dir / f"{part.archive_name}.log"
 
         ratio = part.capacity_used_bytes / part.capacity_cap_bytes
+        remaining_after = cap_plan.cap_bytes - current_tape_used - part.capacity_used_bytes
         print("\n" + "=" * 60)
-        print(f"📦 准备写入 {part.project_name} {part.archive_name}")
+        print(f"📦 准备写入 {part.project_name} {part.archive_name} → Tape{tape_idx:02d}")
         print(f"   文件数:        {part.file_count}")
         print(f"   数据体积:      {format_size(part.capacity_used_bytes)} "
               f"({ratio * 100:.1f}% of {format_size(part.capacity_cap_bytes)})")
         print(f"   起始文件:      {part.first_file}")
         print(f"   终止文件:      {part.last_file}")
-        print(f"   目标磁带:      {mount}")
+        print(f"   目标磁带:      {mount} (Tape{tape_idx:02d})")
+        print(f"   本盘写后剩余:  {format_size(max(0, remaining_after))}")
         print("=" * 60)
 
         # 断点续写识别
@@ -239,14 +320,8 @@ class Workflow:
 
         print(f"[√] {part.archive_name} 写入完成 (Manifest: {manifest_path.name}, "
               f"Catalog: {catalog_path.name}, log: {log_path.name})")
-
-        if not is_last_part:
-            print(f"\n[!] 请弹出当前磁带：umount {mount}")
-            print("[!] 换上新的空磁带（或已写入部分数据的磁带），重新挂载 LTFS")
-            if not prompt("准备好后按 [Enter] 继续下一盘",
-                          default_yes=self.config.yes,
-                          non_interactive=self.config.non_interactive):
-                raise UserAbortedError("用户在盘间换带时取消")
+        # 磁带切换由 _archive_all 中的 tape_assignment 检测并通过 _prompt_tape_swap 处理
+        # 此处不再重复询问
 
     def _handle_resume_choice(self, part: TapePart) -> None:
         """处理磁带上同一盘 Part 的恢复选择。"""

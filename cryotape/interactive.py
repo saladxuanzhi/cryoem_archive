@@ -8,8 +8,10 @@ from typing import Optional
 
 from .constants import (
     DEFAULT_CSV_CATALOG,
+    DEFAULT_INTEGRITY_PRIORITY,
     DEFAULT_LOG_DIR,
     DEFAULT_LTFS_MOUNT,
+    DEFAULT_MIN_TAIL_GB,
     DEFAULT_NEW_TAPE_CAPACITY_GB,
     DEFAULT_SAFETY_MARGIN_GB,
 )
@@ -34,6 +36,8 @@ class RuntimeConfig:
     csv_catalog: Path
     safety_margin_gb: float
     new_tape_capacity_gb: float
+    min_tail_gb: float
+    integrity_priority: bool
     dry_run: bool
     verbose: bool
     non_interactive: bool
@@ -49,6 +53,8 @@ class RuntimeConfig:
             csv_catalog=Path(DEFAULT_CSV_CATALOG),
             safety_margin_gb=DEFAULT_SAFETY_MARGIN_GB,
             new_tape_capacity_gb=DEFAULT_NEW_TAPE_CAPACITY_GB,
+            min_tail_gb=DEFAULT_MIN_TAIL_GB,
+            integrity_priority=DEFAULT_INTEGRITY_PRIORITY,
             dry_run=False,
             verbose=False,
             non_interactive=False,
@@ -74,6 +80,8 @@ class InteractiveConfigurator:
         "log_dir": ("日志目录", "_edit_path"),
         "safety_margin_gb": ("安全余量 (GB)", "_edit_float"),
         "new_tape_capacity_gb": ("标准空磁带容量 (GB)", "_edit_float"),
+        "min_tail_gb": ("跨项目最小剩余 (GB)", "_edit_float"),
+        "integrity_priority": ("项目完整度优先", "_edit_bool"),
         "dry_run": ("仅预演 (--dry-run)", "_edit_bool"),
         "verbose": ("实时显示 tar 输出 (--verbose)", "_edit_bool"),
         "non_interactive": ("跳过交互确认", "_edit_bool"),
@@ -120,6 +128,8 @@ class InteractiveConfigurator:
         print(f"  本地 CSV 台账:      {self.config.csv_catalog}")
         print(f"  安全余量:           {self.config.safety_margin_gb} GB")
         print(f"  标准空磁带容量:     {self.config.new_tape_capacity_gb} GB")
+        print(f"  跨项目最小剩余:     {self.config.min_tail_gb} GB")
+        print(f"  项目完整度优先:     {self.config.integrity_priority}")
         print(f"  日志目录:           {self.config.log_dir}")
         print(f"  --dry-run:          {self.config.dry_run}")
         print(f"  --verbose:          {self.config.verbose}")

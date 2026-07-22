@@ -81,12 +81,67 @@ python -m cryotape /data/cryoem/Session_2026Q3
 | `--csv-catalog PATH` | `~/cryotape_catalog.csv` | 本地总 CSV 台账路径 |
 | `--safety-margin GB` | `15` | 磁带安全预留空间 |
 | `--new-tape-capacity GB` | `2250` | 标准空磁带可用容量 |
+| `--min-tail-gb GB` | `100` | 跨项目共享磁带空间时的最小剩余阈值 |
+| `--prefer-project-integrity` | `False` | 项目完整度优先（一个项目独占一盘） |
 | `--dry-run` | `False` | 预演模式，仅计算与打印摘要 |
 | `--verbose / -v` | `False` | 实时显示 tar 输出（默认仅写到日志） |
 | `--non-interactive` | `False` | 跳过所有交互确认（包括参数确认环节） |
 | `--yes / -y` | `False` | 所有提示默认确认 |
 | `--log-dir PATH` | `./logs` | per-tape tar 日志目录 |
 | `--no-review` | `False` | 仅跳过执行前的参数确认环节（保留磁带前确认） |
+
+## 算法规则（跨项目磁带共享）
+
+`GlobalPacker` 把所有项目的文件按字典序统一处理，按需把多个项目装入同一盘磁带。提供**两种策略**：
+
+### 策略 A：节省空间优先（默认）
+
+`--prefer-project-integrity` **未**指定时的默认行为。
+
+1. **单项目贪心切分**：单个项目 > 单盘容量时，按文件顺序切分为多 Part（`{project}_Part01.tar`、`Part02.tar`...），每个 Part 落到不同磁带。
+2. **项目切换决策**：写完一个项目切换到下一个时：
+   - 若当前磁带剩余 < `min_tail_gb`（默认 100 GB）→ **开新磁带**
+   - 否则 → 继续在同一盘磁带上写下一个项目
+3. **项目自动拆分**：下一个项目整体放不下当前磁带剩余空间时，**自动拆分为多 Part 跨磁带**（例：`C_Part01.tar` 在 Tape01 末尾，`C_Part02.tar` 在 Tape02 开头），最大化磁带利用率。
+
+### 策略 B：项目完整度优先
+
+加 `--prefer-project-integrity` 标志。
+
+1. **单项目不跨盘**：一个 project 只能整体放入一盘磁带。
+2. **项目切换决策**：
+   - 若当前磁带剩余 < `min_tail_gb` → **开新磁带**
+   - 若下一个 project 整体放不下当前磁带剩余空间 → **开新磁带**
+   - 否则 → 继续在同一盘磁带上写下一个 project
+3. **大项目仍可拆**：单 project > 单盘容量时仍会被迫拆分为多 Part（不可避免）。
+
+### 示例对比（4 个项目，cap=3.68 TB，min_tail=100 GB）
+
+```
+项目   大小
+A   1.60 TB
+B   1.36 TB
+C   1.65 TB
+D   2.13 TB
+```
+
+**节省空间优先**（默认）：2 盘
+
+```
+Tape01: A_Part01 + B_Part01 + C_Part01 = 3.68 TB（满）
+Tape02: C_Part02 + D_Part01           = 3.06 TB
+```
+
+**项目完整度优先**（`--prefer-project-integrity`）：3 盘
+
+```
+Tape01: A_Part01 + B_Part01            = 2.96 TB（A、B 各占 1 Part）
+Tape02: C_Part01                       = 1.65 TB（C 独占 1 盘）
+Tape03: D_Part01                       = 2.13 TB（D 独占 1 盘）
+```
+
+节省空间优先节省一整盘磁带（≈2.5 TB），但代价是 C 被拆到两盘（解压时需要合并）。
+完整度优先每个项目独立完整、易于管理，但可能浪费磁带剩余空间。
 
 ## 代码结构
 
