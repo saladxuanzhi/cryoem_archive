@@ -24,3 +24,30 @@ wheels/
 .claude
 *.zip
 archive/
+
+# CryoTape runtime
+logs/
+*.log
+/tmp_cryotape_*
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local catalog CSVs (do not commit user data)
+*_catalog.csv
+Tape_Archive_Report.csv
+
+# Virtual environments
+.venv/
+venv/
