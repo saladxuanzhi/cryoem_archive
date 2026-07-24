@@ -26,6 +26,7 @@ from .utils import (
     format_size,
     prompt,
     prompt_choice,
+    prompt_text,
     today_date,
 )
 from .validator import PathValidator
@@ -231,11 +232,55 @@ class Workflow:
                       non_interactive=self.config.non_interactive):
             raise UserAbortedError("用户在换带时取消")
 
+    def _detect_existing_volume_name(self) -> str:
+        """扫描挂载点根目录已存在的 Catalog_Part*.csv，返回其中
+        已记录的磁带卷名（同盘磁带的所有 Part 共享同一卷名）。"""
+        inv = self.resume.inspect_mount()
+        for cat_path in inv.has_catalog_files:
+            try:
+                import csv as _csv
+                with cat_path.open("r", newline="", encoding="utf-8") as f:
+                    reader = _csv.DictReader(f)
+                    for row in reader:
+                        vn = (row.get("磁带卷名") or "").strip()
+                        if vn:
+                            return vn
+            except OSError:
+                continue
+        return ""
+
+    def _prompt_volume_name(self, default: str = "") -> str:
+        """提示用户输入 / 确认磁带卷名。
+
+        - 若 ``default`` 非空（来自同盘旧 Catalog），直接采用。
+        - 若 non_interactive 模式，返回 ``default``（可能为空）。
+        - 交互模式下若用户留空回车且 ``default`` 为空，拒绝通过。
+        """
+        if self.config.non_interactive:
+            return default
+        print(f"\n[*] 磁带卷名（标签纸 / 磁带外壳标记的标识符）:")
+        if default:
+            print(f"    检测到磁带上已有 Catalog，建议沿用: {default!r}")
+            print(f"    直接回车确认，或输入新卷名覆盖（一般仅在换磁带时改）。")
+        else:
+            print(f"    未检测到已有 Catalog——请录入标签纸上的卷名")
+            print(f"    （例如 TAPE-2026-07-24-A）。不允许为空。")
+        while True:
+            try:
+                ans = input(f"磁带卷名 [{default}]: ").strip()
+            except EOFError:
+                return default
+            if ans:
+                return ans
+            if default:
+                return default
+            print("    卷名不能为空，请输入或 Ctrl-C 取消。")
+
     def _write_one_part(self, *, part: TapePart, parent_dir: Path,
                         cap_plan: CapacityPlan, is_last_part: bool,
                         tape_idx: int = 0,
                         current_tape_used: int = 0) -> None:
-        """处理单盘的完整生命周期：摘要→确认→Manifest→tar→盘内CSV→本地CSV。"""
+        """处理单盘的完整生命周期：摘要→卷名→确认→Manifest→tar→盘内CSV→本地CSV。"""
         mount = self.config.ltfs_mount
         archive_path = mount / part.archive_name
         manifest_path = mount / part.manifest_name
@@ -270,6 +315,10 @@ class Workflow:
                               non_interactive=self.config.non_interactive):
                     raise UserAbortedError("用户拒绝覆盖未完成磁带")
 
+        # 磁带卷名：先尝试从磁带上现有 Catalog 推断；推断不到再问用户
+        suggested_volume = self._detect_existing_volume_name()
+        volume_name = self._prompt_volume_name(default=suggested_volume)
+
         # 交互确认
         if not prompt(
             f"请确认磁带已挂载到 {mount}，并按 [Enter] 开始写入 {part.archive_name}",
@@ -278,8 +327,8 @@ class Workflow:
         ):
             raise UserAbortedError(f"用户在 {part.archive_name} 前取消")
 
-        # 写本地 CSV pending
-        self.catalog.append_pending(part, mount=mount)
+        # 写本地 CSV pending（带卷名）
+        self.catalog.append_pending(part, mount=mount, volume_name=volume_name)
 
         # 写 Manifest（先于 .tar，确保失败时也能看到清单）
         streamer = TarStreamer(
@@ -287,6 +336,8 @@ class Workflow:
             archive_path=archive_path,
             log_path=log_path,
             verbose=self.config.verbose,
+            show_progress=self.config.show_progress,
+            progress_label=f"Tape{tape_idx:02d}/{part.archive_name}",
         )
         streamer.stream_manifest_file(manifest_path, part.files,
                                       part.capacity_used_bytes)
@@ -302,13 +353,14 @@ class Workflow:
             )
             raise
 
-        # 写盘内 CSV
+        # 写盘内 CSV（带卷名）
         write_date = today_date()
         TapeCatalogWriter.write(
             catalog_path, part,
             status=STATUS_DONE,
             mount=mount,
             write_date=write_date,
+            volume_name=volume_name,
         )
 
         # 改本地 CSV 为 done
@@ -318,7 +370,9 @@ class Workflow:
             new_status=STATUS_DONE,
         )
 
-        print(f"[√] {part.archive_name} 写入完成 (Manifest: {manifest_path.name}, "
+        print(f"[√] {part.archive_name} 写入完成 "
+              f"(卷名: {volume_name!r}, "
+              f"Manifest: {manifest_path.name}, "
               f"Catalog: {catalog_path.name}, log: {log_path.name})")
         # 磁带切换由 _archive_all 中的 tape_assignment 检测并通过 _prompt_tape_swap 处理
         # 此处不再重复询问

@@ -37,8 +37,12 @@ ALL_STATUSES: tuple[str, ...] = (
     STATUS_PENDING, STATUS_DONE, STATUS_FAILED, STATUS_ABORTED,
 )
 
-# CSV 表头（本地总 CSV 与盘内 CSV 共用）
+# CSV 表头（本地总 CSV 与盘内 CSV 共用）。
+# 末尾追加「磁带卷名」字段：标签纸标记的物理磁带标识符，用于
+# 跨盘 / 跨会话识别同一盘磁带。该字段向后兼容（读取旧 CSV 时
+# DictReader 返回 None，写入时 DictWriter 留空）。
 CSV_HEADER: tuple[str, ...] = (
     "写入日期", "项目名称", "分卷编号", "归档文件名", "文件数量",
     "总体积", "起始文件路径", "终止文件路径", "磁带挂载点", "状态",
+    "磁带卷名",
 )

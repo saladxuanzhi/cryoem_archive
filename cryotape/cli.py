@@ -19,7 +19,7 @@ from .interactive import InteractiveConfigurator, RuntimeConfig
 from .utils import setup_logging
 from .workflow import Workflow
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -66,6 +66,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-review", action="store_true",
                    help="跳过执行前的参数确认环节（与 --non-interactive 不同，"
                         "本选项仅跳过开头的 review，不影响后续磁带确认）")
+    p.add_argument("--no-progress", dest="show_progress",
+                   action="store_false", default=True,
+                   help="禁用 tar 写入进度条（默认开启；非 TTY 时自动禁用）")
     p.add_argument("--version", action="version",
                    version=f"%(prog)s {__version__}")
     return p
@@ -102,6 +105,7 @@ def args_to_config(args: argparse.Namespace) -> RuntimeConfig:
         non_interactive=bool(args.non_interactive),
         yes=bool(args.yes),
         log_dir=Path(args.log_dir).expanduser(),
+        show_progress=bool(args.show_progress),
     )
 
 

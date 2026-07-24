@@ -27,6 +27,7 @@ from .exceptions import (
     UserAbortedError,
 )
 from .interactive import InteractiveConfigurator, RuntimeConfig
+from .progress import ProgressBar
 from .types import (
     CapacityPlan,
     FileEntry,
@@ -35,7 +36,7 @@ from .types import (
 )
 from .workflow import Workflow
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 __all__ = [
     # 版本
@@ -52,5 +53,5 @@ __all__ = [
     # 数据类型
     "CapacityPlan", "FileEntry", "ProjectInfo", "TapePart",
     # 组件
-    "InteractiveConfigurator", "RuntimeConfig", "Workflow",
+    "InteractiveConfigurator", "ProgressBar", "RuntimeConfig", "Workflow",
 ]

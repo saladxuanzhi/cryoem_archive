@@ -19,8 +19,13 @@ LOG = logging.getLogger("cryotape")
 
 
 def catalog_row_for(part: TapePart, *, status: str, mount: Path,
-                    write_date: str) -> dict[str, str]:
-    """生成单盘台账的字典行。"""
+                    write_date: str, volume_name: str = "") -> dict[str, str]:
+    """生成单盘台账的字典行。
+
+    Args:
+        volume_name: 标签纸上标记的磁带卷名（用于跨会话识别同一盘物理磁带）。
+                     缺省为空字符串（旧台账 / 未填写场景）。
+    """
     return {
         "写入日期": write_date,
         "项目名称": part.project_name,
@@ -32,6 +37,7 @@ def catalog_row_for(part: TapePart, *, status: str, mount: Path,
         "终止文件路径": part.last_file,
         "磁带挂载点": str(mount),
         "状态": status,
+        "磁带卷名": volume_name or "",
     }
 
 
@@ -40,10 +46,12 @@ class TapeCatalogWriter:
 
     @staticmethod
     def write(catalog_path: Path, part: TapePart, *, status: str,
-              mount: Path, write_date: str) -> None:
+              mount: Path, write_date: str,
+              volume_name: str = "") -> None:
         catalog_path.parent.mkdir(parents=True, exist_ok=True)
         row = catalog_row_for(part, status=status, mount=mount,
-                              write_date=write_date)
+                              write_date=write_date,
+                              volume_name=volume_name)
         with catalog_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(CSV_HEADER))
             writer.writeheader()
@@ -70,10 +78,17 @@ class LocalCatalog:
         with self.path.open("r", newline="", encoding="utf-8") as f:
             return list(csv.DictReader(f))
 
-    def append_pending(self, part: TapePart, *, mount: Path) -> None:
-        """追加一行 status=pending。"""
+    def append_pending(self, part: TapePart, *, mount: Path,
+                       volume_name: str = "") -> None:
+        """追加一行 status=pending。
+
+        Args:
+            volume_name: 磁带卷名（标签纸上的标识符），可后续通过
+                ``update_volume_name`` 补全。
+        """
         self._append_row(catalog_row_for(
             part, status=STATUS_PENDING, mount=mount, write_date=today_date(),
+            volume_name=volume_name,
         ))
 
     def update_status(self, *, project: str, part_index: int,
@@ -101,6 +116,28 @@ class LocalCatalog:
         """返回所有 status=pending 的行。"""
         return [r for r in self.read_all() if r.get("状态") == STATUS_PENDING]
 
+    def update_volume_name(self, *, project: str, part_index: int,
+                           volume_name: str) -> bool:
+        """补全 (project, Part{nn:02d}) 对应行的磁带卷名。
+
+        用于在写盘前未能及时获得卷名（例如非交互脚本中由外部标签系统
+        异步写入），但事后需要补全的场景。返回是否真的修改了行。
+        """
+        if not self.path.exists():
+            return False
+        target_key = f"Part{part_index:02d}"
+        rows = self.read_all()
+        changed = False
+        for r in rows:
+            if (r.get("项目名称") == project
+                    and r.get("分卷编号") == target_key
+                    and r.get("磁带卷名") != volume_name):
+                r["磁带卷名"] = volume_name
+                changed = True
+        if changed:
+            self._rewrite_all(rows)
+        return changed
+
     def _append_row(self, row: dict[str, str]) -> None:
         new = not self.path.exists()
         with self.path.open("a", newline="", encoding="utf-8") as f:
@@ -116,5 +153,7 @@ class LocalCatalog:
             writer = csv.DictWriter(f, fieldnames=list(CSV_HEADER))
             writer.writeheader()
             for r in rows:
+                # 向后兼容：旧台账行缺少新增的「磁带卷名」键，
+                # DictWriter 会为缺失字段写出空字符串，无需补键。
                 writer.writerow(r)
         os.replace(tmp, self.path)

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .exceptions import TapeWriteError
+from .progress import ProgressBar
 from .types import FileEntry
 from .utils import format_size, now_iso
 from .validator import PathValidator
@@ -50,11 +51,15 @@ class TarStreamer:
     """
 
     def __init__(self, *, parent_dir: Path, archive_path: Path,
-                 log_path: Path, verbose: bool) -> None:
+                 log_path: Path, verbose: bool,
+                 show_progress: bool = True,
+                 progress_label: str = "") -> None:
         self.parent_dir = parent_dir
         self.archive_path = archive_path
         self.log_path = log_path
         self.verbose = verbose
+        self.show_progress = show_progress
+        self.progress_label = progress_label
         # 仅做存在性预检；实际命令使用裸 'tar' 避免 Windows tar.EXE 解析 bug
         PathValidator.check_tar_available()
 
@@ -82,8 +87,11 @@ class TarStreamer:
             lst_path = Path(lst.name)
         _TEMP_REGISTRY.register(lst_path)
 
+        # 计算本 part 总体积（作为进度条分母）
+        total_bytes = sum(f.size_bytes for f in files)
+
         try:
-            self._run_tar(lst_path)
+            self._run_tar(lst_path, total_bytes=total_bytes)
         finally:
             # 3. 清理临时列表
             try:
@@ -91,7 +99,7 @@ class TarStreamer:
             finally:
                 _TEMP_REGISTRY.unregister(lst_path)
 
-    def _run_tar(self, list_path: Path) -> None:
+    def _run_tar(self, list_path: Path, *, total_bytes: int = 0) -> None:
         # 确保父目录存在（磁带根目录理论上已存在，但日志目录需要创建）
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -117,40 +125,52 @@ class TarStreamer:
         ]
 
         LOG.info("执行: %s", " ".join(cmd))
-        with self.log_path.open("w", encoding="utf-8", errors="replace") as logf:
-            logf.write(f"# CryoTape tar log\n# command: {' '.join(cmd)}\n# started: {now_iso()}\n\n")
-            logf.flush()
-            if self.verbose:
-                # 实时把 tar 输出同时写到日志与终端
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    bufsize=1,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
-                    logf.write(line)
-                    logf.flush()
-                ret = proc.wait()
-            else:
-                proc = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    check=False,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                ret = proc.returncode
-                logf.write(proc.stdout)
-            logf.write(f"\n# finished: {now_iso()}\n# returncode: {ret}\n")
+
+        # 启动进度条（非 TTY 时自动空操作）
+        progress = ProgressBar(
+            total_bytes=total_bytes,
+            enabled=self.show_progress,
+            label=self.progress_label or self.archive_path.name,
+        )
+        progress.start(self.archive_path)
+
+        try:
+            with self.log_path.open("w", encoding="utf-8", errors="replace") as logf:
+                logf.write(f"# CryoTape tar log\n# command: {' '.join(cmd)}\n# started: {now_iso()}\n\n")
+                logf.flush()
+                if self.verbose:
+                    # 实时把 tar 输出同时写到日志与终端
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        bufsize=1,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                        logf.write(line)
+                        logf.flush()
+                    ret = proc.wait()
+                else:
+                    proc = subprocess.run(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        check=False,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    ret = proc.returncode
+                    logf.write(proc.stdout)
+                logf.write(f"\n# finished: {now_iso()}\n# returncode: {ret}\n")
+        finally:
+            progress.stop()
 
         if ret != 0:
             raise TapeWriteError(

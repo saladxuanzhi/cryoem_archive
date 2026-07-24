@@ -12,6 +12,8 @@
 - **双层台账**：本地总 CSV 累计所有项目所有磁带，每盘磁带根目录也保存一份单盘 CSV，无需本地台账即可离线查询。
 - **断点续写**：启动时扫描本地 CSV 的 `pending` 行；插入磁带后自动识别是否对应未完成的归档，提供恢复 / 丢弃 / 取消。
 - **Manifest 索引**：每盘磁带根目录生成 `Manifest_Part{nn}.txt`，纯文本文件列表。
+- **磁带卷名（标签纸）**：每条台账记录 `磁带卷名` 字段（标签纸上标记的物理磁带标识符），用于跨会话识别同一盘磁带、便于数据管理；同盘磁带再次插入时自动复用已有卷名。
+- **写入进度条**：tar 流式写入期间实时显示进度（百分比、字节数、吞吐、ETA）；非 TTY 场景自动静默。
 - **交互式参数确认**：执行前打印所有运行参数，允许用户逐项确认或修改后再执行。
 
 ## 安装
@@ -89,6 +91,7 @@ python -m cryotape /data/cryoem/Session_2026Q3
 | `--yes / -y` | `False` | 所有提示默认确认 |
 | `--log-dir PATH` | `./logs` | per-tape tar 日志目录 |
 | `--no-review` | `False` | 仅跳过执行前的参数确认环节（保留磁带前确认） |
+| `--no-progress` | `False` | 禁用 tar 写入进度条（默认开启；非 TTY 时自动静默） |
 
 ## 算法规则（跨项目磁带共享）
 
@@ -151,7 +154,7 @@ CryoTape/
 ├── cryotape/                # 业务包
 │   ├── __init__.py          # 公开 API
 │   ├── __main__.py          # 支持 python -m cryotape
-│   ├── constants.py         # 常量、状态枚举、CSV 表头
+│   ├── constants.py         # 常量、状态枚举、CSV 表头（含磁带卷名字段）
 │   ├── exceptions.py        # 异常体系
 │   ├── types.py             # dataclass: FileEntry / ProjectInfo / TapePart / CapacityPlan
 │   ├── utils.py             # format_size / 交互提示
@@ -160,12 +163,13 @@ CryoTape/
 │   ├── discovery.py         # FileDiscovery
 │   ├── capacity.py          # TapeCapacityPlanner
 │   ├── packer.py            # TapePacker
-│   ├── streamer.py          # TarStreamer (含 Manifest 写入)
-│   ├── catalog.py           # LocalCatalog / TapeCatalogWriter
+│   ├── streamer.py          # TarStreamer (含 Manifest 写入 + 进度条)
+│   ├── progress.py          # ProgressBar (纯标准库 ASCII 进度条)
+│   ├── catalog.py           # LocalCatalog / TapeCatalogWriter (含磁带卷名)
 │   ├── resume.py            # ResumeHandler
 │   ├── interactive.py       # InteractiveConfigurator / RuntimeConfig
 │   ├── cli.py               # argparse + main()
-│   └── workflow.py          # Workflow (主流程 orchestration)
+│   └── workflow.py          # Workflow (主流程 orchestration，含卷名提示)
 └── tests/
     ├── conftest.py
     ├── test_capacity.py
@@ -173,9 +177,12 @@ CryoTape/
     ├── test_detector.py
     ├── test_discovery.py
     ├── test_end_to_end.py
+    ├── test_global_packer.py
     ├── test_interactive.py
     ├── test_packer.py
-    └── test_streamer.py
+    ├── test_progress.py
+    ├── test_streamer.py
+    └── test_workflow.py
 ```
 
 ## 工作流
@@ -185,11 +192,41 @@ CryoTape/
 3. **预演摘要**（dry-run 模式）：打印每卷的起止文件与体积，不写磁带。
 4. **写盘循环**（真实模式）：每盘依次
    - 打印摘要（文件数、起止、体积）
+   - 询问磁带卷名（自动沿用磁带上既有 Catalog_Part*.csv 中的卷名）
    - 用户确认后，写 `Manifest_Part{nn}.txt`
-   - 流式 `tar -cf` 写 `.tar`（CPU 不压缩）
-   - 写盘内 `Catalog_Part{nn}.csv`
+   - 流式 `tar -cf` 写 `.tar`（CPU 不压缩）+ 实时显示进度条
+   - 写盘内 `Catalog_Part{nn}.csv`（含磁带卷名字段）
    - 追加本地总 CSV，状态 `done`
    - 提示换带
+
+## 磁带卷名（标签纸标识）
+
+冷冻电镜归档通常会把同一项目跨多盘磁带（部分项目 > 2.25 TB）。为避免「下次插入这盘磁带时不确定它原来是谁」，CryoTape 在本地 CSV 与盘内 CSV 都记录一列 `磁带卷名`：
+
+- **录入时机**：每盘写入前提示输入；若磁带上已有 `Catalog_PartNN.csv`，自动沿用其卷名（同盘磁带复用）。
+- **存储位置**：本地总 CSV 与盘内 `Catalog_PartNN.csv` 各保留一份，离线也能识别。
+- **断点续写**：把已有磁带插回，工具自动读取盘内 CSV 的卷名并填入新行，无需重复录入。
+- **典型命名**：`TAPE-2026-07-24-A`、`LTO6-2026Q3-001` 等贴在磁带外壳 / 标签纸上的标识符。
+
+CSV 表头（节选）：
+
+```
+写入日期, 项目名称, 分卷编号, 归档文件名, 文件数量, 总体积,
+起始文件路径, 终止文件路径, 磁带挂载点, 状态, 磁带卷名
+```
+
+## 写入进度条
+
+`tar` 流式写入期间，stderr 上单行刷新：
+
+```
+[Tape01/Project_A_Part01.tar] [████████████░░░░░░░░░░░░░░░░]  42.5%  1.06 GB / 2.50 GB  15.2 MB/s  ETA 1m32s
+```
+
+- 进度条按 `.tar` 文件大小与本 part 总体积的比例计算，**与 `tar` 实际产出字节数同步**。
+- 非 TTY（管道 / CI / 重定向）时自动禁用，不会污染日志。
+- 加 `--no-progress` 强制关闭。
+- 进度条渲染在 stderr，stdout 仍可用于其它管道。
 
 ## 中断恢复
 

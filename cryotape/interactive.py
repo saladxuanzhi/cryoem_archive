@@ -43,6 +43,7 @@ class RuntimeConfig:
     non_interactive: bool
     yes: bool
     log_dir: Path
+    show_progress: bool
 
     @classmethod
     def with_defaults(cls, project_dir: Path) -> "RuntimeConfig":
@@ -60,6 +61,7 @@ class RuntimeConfig:
             non_interactive=False,
             yes=False,
             log_dir=Path(DEFAULT_LOG_DIR),
+            show_progress=True,
         )
 
 
