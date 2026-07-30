@@ -1,9 +1,9 @@
-# Python
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -19,36 +19,47 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# project
-.claude
-*.zip
-archive/
-
-# CryoTape runtime
-logs/
-*.log
-/tmp_cryotape_*
-
-# Test
-.pytest_cache/
-.coverage
-htmlcov/
-tests/
-
-# IDE
-.idea/
-.vscode/
-*.swp
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Local catalog CSVs (do not commit user data)
-*_catalog.csv
-Tape_Archive_Report.csv
+MANIFEST
 
 # Virtual environments
 .venv/
 venv/
+env/
+ENV/
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.cache/
+.tox/
+
+# mypy / ruff
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Project runtime artifacts
+*.tmp
+/tmp_cryoem_archive_*
+/staging/
+
+# Local catalog database (default location)
+catalog.sqlite3
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
