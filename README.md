@@ -11,38 +11,41 @@
 | 概念 | 含义 | 物理性质 |
 |------|------|----------|
 | **Dataset** | 用户看到的数据逻辑集合 | 逻辑单位 |
-| **Archive**  | 写入磁带的物理单位，约 100 GB | 物理单位，**不跨磁带** |
-| **Tape**     | LTO-6 磁带，约 2400 GB 可用 | 物理介质 |
+| **Archive**  | 写入磁带的物理单位，一个 `.tar.zst` | 物理单位，**不跨磁带** |
+| **Tape**     | LTO-6 磁带（LTFS 挂载，约 2.2 TB 可用） | 物理介质 |
 
 ```
-Dataset ──→ 100 GB Archive 块 ──→ Tape（24 个 Archive 满盘）
+Dataset ──> 动态切分的 Archive（50GB 向下取整 + 40GB 安全区间）──> Tape
 ```
 
 **关键不变量**：
 
-* 每个 Archive 严格控制在 **100 GB** 左右（实际略小，接近压缩后大小）
-* 每盘磁带写入 **24 个 Archive**（100 × 24 = 2400 GB）
-* **任何 Archive 都不能跨磁带**——一盘满就换下一盘
-* 一个 Dataset 可以跨多个 Archive（如果 > 100 GB）
-* 多个小 Dataset 可以合并到一个 Archive
+* Archive 大小**动态决定**：按磁带实时剩余空间计算（50 GB 向下取整，
+  并保留 40 GB 安全区间），没有固定大小
+* **任何 Archive 都不能跨磁带**--剩余空间切不出下一个安全包就换下一盘
+* 一个 Dataset 可以跨多个 Archive（如果很大）
+* 多个小 Dataset 可以合并到一个 Archive（目录库 `file` 表主键含
+  `dataset_id`，不同 Dataset 的同名相对路径不会冲突）
 
-## 为什么是 100 GB / 24 个
+## 动态切分规则
 
-* LTO-6 原始容量 2.5 TB，预留 100 GB 安全余量（磁带物理损耗 + FileMark）
-* 目标可用容量 2400 GB
-* 2400 ÷ 100 = 24，整除，完美填满
-* 这也是「**唯一允许且最完美**」的数据拆分方式
+每个 archive 写入前重新读取磁带剩余空间，然后：
+
+1. 剩余空间向下取整到 50 GB 的整数倍
+2. 若取整后的「空隙」小于 40 GB 安全区间，再退一档（-50 GB）
+3. 剩余空间不足 50 GB 时触发换磁带
+4. 若剩余空间能一次放下所有剩余文件（含安全区间），整个项目作为单一
+   archive 写入，不切分
 
 ## 项目结构
 
-整个项目只有 **5 个 Python 文件**：
-
 ```
 main.py        主菜单和固定配置
-archive.py     100GB 装箱、tar.zst 打包、磁带写入、恢复
-tape.py        mt 操作、磁带提示
-catalog.py     SQLite（5 张表）+ 所有 CRUD
+archive.py     动态装箱、tar.zst 打包、磁带写入、流式恢复/校验
+tape.py        LTFS 挂载点访问、磁带提示
+catalog.py     SQLite（5 张表）+ 所有 CRUD + 备份/迁移
 utils.py       SHA256、format、prompt、log、进度条
+tests_smoke.py 冒烟测试（python tests_smoke.py）
 ```
 
 没有 Repository / DAO / DTO / Service / Controller / Factory / Manager。
@@ -54,18 +57,19 @@ utils.py       SHA256、format、prompt、log、进度条
 ```sql
 tape            -- 每盘磁带一行（label, capacity, archive_count, status）
 dataset         -- 每个 Dataset 一行（name, project, operator, comment）
-archive         -- 每个 100GB Archive 一行（name, size, sha256, tape_label, file_number）
+archive         -- 每个 Archive 一行（name, size, sha256, tape_label, file_number）
 dataset_archive -- 关联表：哪些 archive 包含哪些 dataset，以及在 dataset 内的顺序
-file            -- 每个文件一行（archive_name, dataset_id, rel_path, size, mtime）
+file            -- 每个文件一行（主键 archive_name + dataset_id + rel_path）
 ```
 
 外键全部开启 (`PRAGMA foreign_keys = ON`)，所有写入走 `BEGIN IMMEDIATE` 事务。
+旧版目录库（`file` 主键缺 `dataset_id`）在打开时自动无损迁移。
 
 ## Archive 命名
 
 `YYYYMMDD_NNNN.tar.zst`，例如 `20260728_0001.tar.zst`。
 
-编号全局递增（不是每盘重置），并发安全（`IMMEDIATE` 事务内分配）。
+编号按天懒分配（写入前才取名，避免预分配浪费）。
 
 ## 运行
 
@@ -81,11 +85,13 @@ python main.py
 ========================================
   CryoEM 磁带归档工具
 ========================================
-  1 创建 Archives（多 Dataset → 100GB 分块）
+  1 创建 Archives（多 Dataset -> 动态切分）
   2 恢复 Dataset（自动按序提取所有 archive）
   3 查询（datasets / archives / 文件）
   4 校验磁带
   5 查看台账
+  6 导出台账 (CSV)
+  7 重建目录库（从磁带 manifest）
   0 退出
 ========================================
 ```
@@ -121,52 +127,80 @@ python main.py /mnt/tmp/20260515_wl \
 | `--operator O`       | 操作员 |
 | `--comment C`        | 备注 |
 | `--tape-label L`     | 目标磁带标签 |
-| `--tape-device D`    | 原始磁带设备（默认 `/dev/nst0`）|
-| `--ltfs-mount PATH`  | LTFS 挂载点（与 `--tape-device` 互斥）|
+| `--ltfs-mount PATH`  | LTFS 挂载点（默认 `/mnt/ltfs`）|
 | `--db PATH`          | 目录库 SQLite 文件 |
 | `--log PATH`         | 日志文件 |
 
 如果只指定了数据目录而其他参数未给，程序会在运行时逐一询问。
 如果只指定 `source` 而不指定 `--dataset`，则用目录名作为默认 Dataset 名称。
 
-### 原始磁带 vs LTFS
+## 磁带操作（LTFS）
 
-* **`/dev/nst0`（默认）**：使用 `mt` + `dd` 直接控制 LTO 驱动器，
-  通过 `mt weof` 写 FileMark。需要在终端前手动换带。
-* **`--ltfs-mount PATH`**：磁带以 LTFS 文件系统形式挂载，每个 archive
-  就是一个普通文件（`PATH/<tape_label>/<archive_name>.tar.zst`）。
-  无需 `mt`，无需 FileMark；适合在 GUI 环境或远程服务器上操作。
+新磁带首次使用前需手动格式化并挂载；常用命令：
+
+```bash
+# 查看 SCSI 设备列表，找到磁带驱动器对应的 sg 设备（如 /dev/sg1）
+lsscsi -g
+
+# 格式化磁带并写入卷名（--force 会清空磁带上全部数据，仅在全新/
+# 确认可废弃的磁带上使用）
+sudo mkltfs -d /dev/sg1 -n EM_data_3 --force
+
+# 挂载磁带
+sudo ltfs -o devname=/dev/sg1 /mnt/ltfs
+
+# 卸载磁带（换带前执行）
+umount /mnt/ltfs
+```
+
+注意：卷名（`-n`）必须与程序中的磁带标签一致（如 `EM_data_3`），
+恢复/校验时程序按标签提示插带。
 
 ### 1 创建 Archives
 
 1. 依次输入每个 Dataset：数据目录 + 名称 + Project + Operator + Comment
-2. 系统扫描所有文件
-3. 顺序装箱：不断读取下一个文件；当前 Archive 满 100 GB 就关闭
-4. 预分配 archive 名字（YYYYMMDD_NNNN）
-5. 显示计划：需要几个 archive、几盘磁带
-6. 确认后逐个构建 + 写磁带
-7. 一盘满 24 个 archive 时自动提示换带
+2. 系统扫描所有文件（目录符号链接、无法读取的文件、空目录都会明确提示，
+   不再静默跳过）
+3. 续传：已在磁带上的文件自动跳过；归档后被修改过的文件（size/mtime 与
+   目录库不符）会重新归档
+4. 确认后进入动态切分主循环：算目标大小 -> 切一包 -> 写磁带 -> 复测
+   剩余空间 -> 重复；空间不足自动提示换带
+5. 每个 archive 落盘后同目录写一份 `<name>.manifest.json` sidecar
+6. 每成功入库一个 archive，自动备份一次目录库到 `data/backups/`
 
 ### 2 恢复 Dataset
 
 1. 输入 Dataset 名称
 2. 系统查出该 Dataset 涉及的所有 archive（按顺序）
 3. 提示插入第一盘磁带
-4. 逐个读取、校验 SHA256、解压到目标目录
-5. 需要换带时自动提示
+4. **流式**恢复：边读磁带边算 SHA256 -> `zstd -d` -> `tar -x`，
+   不把 archive 拷到本地磁盘（单包可达 ~950 GB）
+5. 只解出该 Dataset 自己的文件（同一 archive 里其他 Dataset 的文件不动）
+6. SHA256 不符时删除本次解出的内容再报错；需要换带时自动提示
 
 中途 Ctrl+C 安全：catalog 永远不会有半条记录。
 
+### 4 校验磁带
+
+逐个 archive 流式读回并比对 SHA256（不落盘）。从 manifest 重建的
+archive 记录没有 SHA256，首次校验通过后自动回填。
+
+### 7 重建目录库
+
+`catalog.sqlite3` 丢失/损坏时的兜底：从当前挂载磁带上的
+`*.manifest.json` 重建 tape/dataset/archive/file 记录。幂等，可逐盘磁带
+重复执行；重建后跑一次「校验磁带」回填 SHA256。
+
 ## 固定配置
 
-所有本地数据（数据库、日志、暂存目录）默认放在程序目录下的 `data/` 子目录中：
+所有本地数据（数据库、日志、备份）默认放在程序目录下的 `data/` 子目录中：
 
 ```
 <程序目录>/
 ├── data/
 │   ├── catalog.sqlite3       # SQLite 目录库
 │   ├── cryoem_archive.log    # 运行日志
-│   └── staging/              # 打包过程中的 .tar.zst 暂存
+│   └── backups/              # 目录库自动备份（保留最近 10 份）
 ├── main.py
 ├── archive.py
 ├── catalog.py
@@ -179,8 +213,8 @@ python main.py /mnt/tmp/20260515_wl \
 需要改其他参数时，修改 `main.py` 顶部的常量：
 
 ```python
-TAPE_DEVICE   = "/dev/nst0"          # 磁带设备
-LTO6_CAPACITY = 2_500_000_000_000    # 2.5 TB（来自 archive.LTO6_RAW_BYTES）
+LTFS_MOUNT_DEFAULT = "/mnt/ltfs"    # LTFS 挂载点
+LTO6_CAPACITY      = 2_500_000_000_000    # 2.5 TB 裸容量（仅台账记录用）
 ```
 
 ## 依赖
@@ -188,16 +222,13 @@ LTO6_CAPACITY = 2_500_000_000_000    # 2.5 TB（来自 archive.LTO6_RAW_BYTES）
 * Python ≥ 3.9
 * GNU `tar`
 * `zstd`
-* `mt`
-* `dd`
 
 ## 进度条
 
-耗时操作会显示进度条到 stderr：
+耗时操作会显示字节级进度条（速度 + ETA）到 stderr：
 
-* 文件哈希：`[=====>     ] 50.0% (1234/2468)`
-* tar+zstd 压缩：`[=====>     ] 50.0% (93.1 GiB/100 GiB)`
-* 写磁带：显示 `archive 5/24` 这种行号进度
+* 写磁带：`[====>  ] 50.0% 50.00 GB/100.00 GB 160.2 MB/s ETA 5m12s`
+* 读磁带 / 校验：同上
 
 ## 安装（可选）
 

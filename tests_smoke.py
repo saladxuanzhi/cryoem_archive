@@ -22,12 +22,14 @@ GB = 1_000_000_000  # 供测试使用的十进制 GB 常量
 
 
 def test_format_bytes() -> None:
+    # 十进制单位（1 KB = 1000 B）：与项目容量常量、磁带标称容量同口径。
     assert utils.format_bytes(0) == "0 B"
-    assert utils.format_bytes(1024) == "1.00 KiB"
-    assert utils.format_bytes(1024 * 1024) == "1.00 MiB"
-    assert utils.format_bytes(100_000_000_000) == "93.13 GiB"
-    assert utils.format_bytes(2_500_000_000_000) == "2.27 TiB"
-    print("  OK  format_bytes")
+    assert utils.format_bytes(999) == "999 B"
+    assert utils.format_bytes(1024) == "1.02 KB"
+    assert utils.format_bytes(1024 * 1024) == "1.05 MB"
+    assert utils.format_bytes(100_000_000_000) == "100.00 GB"
+    assert utils.format_bytes(2_500_000_000_000) == "2.50 TB"
+    print("  OK  format_bytes (十进制单位)")
 
 
 def test_sha256_known_value() -> None:
@@ -407,10 +409,11 @@ def test_resume_skips_archived_files() -> None:
 
 
 def test_calculate_chunk_size() -> None:
-    """需求 1 第 2 点的安全规则：以 50GB 向下取整 + 20GB 安全区间复测。
+    """需求 1 第 2 点的安全规则：以 50GB 向下取整 + 安全区间复测。
 
-    用户原文档的 4 个示例（973/960/125/115 GB）都按 20GB safe_margin 计算，
-    所以显式传参；默认参数则按 :data:`archive.SAFE_MARGIN_BYTES` 校验。
+    项目常量 :data:`archive.SAFE_MARGIN_BYTES` 定为 40GB（代码为准）；
+    用户原文档的 4 个示例（973/960/125/115 GB）按 20GB safe_margin 计算，
+    所以显式传参校验。默认参数（40GB）单独断言。
     """
     GB = 1_000_000_000
     safe = 20 * GB
@@ -439,12 +442,16 @@ def test_calculate_chunk_size() -> None:
     # 自定义参数：multiple=10, margin=5
     assert archive.calculate_chunk_size(27 * GB, safe_margin=5 * GB, multiple=10 * GB) == 20 * GB
 
-    # 默认参数走项目常量 SAFE_MARGIN/CHUNK_MULTIPLE：与显式传相同值结果一致。
-    assert (
-        archive.calculate_chunk_size(973 * GB)
-        == archive.calculate_chunk_size(973 * GB, archive.SAFE_MARGIN_BYTES, archive.CHUNK_MULTIPLE_BYTES)
-    )
-    print("  OK  calculate_chunk_size (边界 / 用户举例 / 自定义参数 / 默认常量)")
+    # 默认参数（SAFE_MARGIN_BYTES=40GB，项目实际行为）：
+    # 973GB：取整 950，leftover 23 < 40 -> 退一档 -> 900GB
+    assert archive.calculate_chunk_size(973 * GB) == 900 * GB
+    # 125GB：取整 100，leftover 25 < 40 -> 退一档 -> 50GB
+    assert archive.calculate_chunk_size(125 * GB) == 50 * GB
+    # 140GB：取整 100，leftover 40 >= 40（恰好等于安全区间，不退档）-> 100GB
+    assert archive.calculate_chunk_size(140 * GB) == 100 * GB
+    # 70GB：取整 50，leftover 20 < 40 -> 退档到 0 -> 换磁带
+    assert archive.calculate_chunk_size(70 * GB) == 0
+    print("  OK  calculate_chunk_size (边界 / 20GB 示例 / 自定义参数 / 默认 40GB 常量)")
 
 
 def test_dynamic_create_archives_loop() -> None:
@@ -473,6 +480,7 @@ def test_dynamic_create_archives_loop() -> None:
     tmp = Path(tempfile.mkdtemp(prefix="cryoem_dyn_"))
     original_prompt = tape_mod.prompt_for_full_tape_swap
     original_confirm = utils.confirm
+    original_archive_confirm = archive.confirm
     try:
         # 一组真实文件 -> tar，可走完 build_and_write_archive 链路
         src = tmp / "ds"
@@ -492,22 +500,30 @@ def test_dynamic_create_archives_loop() -> None:
         # free=70GB（enough for 50GB chunk）× N 次：每个 archive 后我们观察真实剩余
         # → 全部走动态循环（不触发换磁带）
         utils.confirm = lambda *a, **kw: True  # 自动确认
+        # create_archives/walk_dataset 用的是 archive 命名空间里的 confirm
+        # （from utils import confirm），必须补丁在 archive 上才生效。
+        archive.confirm = lambda *a, **kw: True
         # Stub 仅拦截 free_bytes，其它方法走真实实现
         stub = StubDevice([70 * GB, 70 * GB, 70 * GB, 70 * GB, 70 * GB])
         stub._real = real_device
 
         written = archive.create_archives(
             conn, stub, [ds_spec], "T1", archive.LTO6_RAW_BYTES,
+            backup_dir=tmp / "backups",
         )
         # 7 个文件每个 2MiB，约 0.03GiB 总大小；70GiB / 50GiB = 单包
         assert len(written) == 1, f"expected 1 archive, got {len(written)}"
         assert (mount / f"{written[0]['name']}.tar.zst").exists()
         assert (mount / f"{written[0]['name']}.manifest.json").exists()
+        # 每成功入库一个 archive 应留一份目录库快照
+        backups = list((tmp / "backups").glob("catalog-*.sqlite3"))
+        assert len(backups) == 1, f"expected 1 catalog backup, got {len(backups)}"
         conn.close()
         print("  OK  create_archives dynamic loop (chunk via calculate_chunk_size)")
     finally:
         tape_mod.prompt_for_full_tape_swap = original_prompt
         utils.confirm = original_confirm
+        archive.confirm = original_archive_confirm
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -619,6 +635,424 @@ def test_constants() -> None:
     print("  OK  constants (LTO-6 raw + 动态切分常量 sanity)")
 
 
+def test_file_table_migration() -> None:
+    """v1 (archive_name, rel_path) 主键的旧库打开时必须被无损迁移到 v2。
+
+    v1 的隐患：一个 archive 混装多个 dataset 时，不同 dataset 的相同
+    rel_path 会撞主键 -> insert_files_batch 失败 -> 整包被当 orphan 删除。
+    """
+    import sqlite3
+
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_mig_"))
+    try:
+        db = tmp / "old.sqlite3"
+        # 手工搭一个 v1 库（file 表主键没有 dataset_id）
+        old = sqlite3.connect(str(db))
+        old.executescript(catalog.SCHEMA.replace(
+            "PRIMARY KEY (archive_name, dataset_id, rel_path)",
+            "PRIMARY KEY (archive_name, rel_path)",
+        ))
+        old.execute(
+            "INSERT INTO tape (label, capacity_bytes, archive_count, status, first_used, last_used) "
+            "VALUES ('T1', 1, 0, 'in_use', 't', 't')"
+        )
+        old.execute("INSERT INTO dataset (name, create_time) VALUES ('DS', 't')")
+        old.execute(
+            "INSERT INTO archive (name, create_time, archive_size, uncompressed_size, sha256, tape_label, file_number) "
+            "VALUES ('20260729_0001', 't', 1, 1, 'x', 'T1', 1)"
+        )
+        old.executemany(
+            "INSERT INTO file (archive_name, dataset_id, rel_path, size, mtime) VALUES (?,?,?,?,?)",
+            [("20260729_0001", 1, "Movies/a.mrc", 10, "t"),
+             ("20260729_0001", 1, "Movies/b.mrc", 20, "t")],
+        )
+        old.commit()
+        old.close()
+
+        conn = catalog.open_db(str(db))  # 触发迁移
+        n = conn.execute("SELECT COUNT(*) FROM file").fetchone()[0]
+        assert n == 2, "migration must not lose rows"
+        assert catalog._file_table_pk(conn) == catalog._FILE_TABLE_PK_COLUMNS
+
+        # 迁移后，v1 时代必然失败的「同 archive 不同 dataset 相同 rel_path」
+        # 现在可以入库了。
+        conn.execute("INSERT INTO dataset (name, create_time) VALUES ('DS2', 't')")
+        old_err = None
+        try:
+            conn.execute(
+                "INSERT INTO file (archive_name, dataset_id, rel_path, size, mtime) "
+                "VALUES ('20260729_0001', 2, 'Movies/a.mrc', 10, 't')"
+            )
+        except sqlite3.IntegrityError as exc:  # pragma: no cover
+            old_err = exc
+        assert old_err is None, f"duplicate rel_path across datasets still rejected: {old_err}"
+
+        # 再次打开：不重复迁移，数据完好
+        conn.close()
+        conn = catalog.open_db(str(db))
+        assert conn.execute("SELECT COUNT(*) FROM file").fetchone()[0] == 3
+        conn.close()
+        print("  OK  file 表 v1->v2 主键迁移（无损 + 可重入 + 多 dataset 共包）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_search_like_escape() -> None:
+    """LIKE 无 ESCAPE 子句时，含下划线的 glob 必然搜不到（曾经的真实 bug）。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_like_"))
+    try:
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        catalog.ensure_tape(conn, "T1", archive.LTO6_RAW_BYTES)
+        ds_id = catalog.ensure_dataset(conn, "DS")
+        with catalog.transaction(conn):
+            catalog.insert_archive(
+                conn, name="20260729_0001", archive_size=1, uncompressed_size=1,
+                sha256="a" * 64, tape_label="T1", file_number=1,
+            )
+            catalog.insert_files_batch(conn, [
+                ("20260729_0001", ds_id, "Movies/foo_bar.mrc", 1, "t"),
+                ("20260729_0001", ds_id, "Movies/foobar.mrc", 1, "t"),
+                ("20260729_0001", ds_id, "a%b.mrc", 1, "t"),
+                ("20260729_0001", ds_id, "axb.mrc", 1, "t"),
+            ])
+
+        hits = archive.search_files(conn, "*foo_bar.mrc")
+        assert [h["path"] for h in hits] == ["Movies/foo_bar.mrc"], (
+            f"underscore pattern broken: {hits}"
+        )
+        # 字面 % 也不应被当通配符
+        hits = archive.search_files(conn, "a%b.mrc")
+        assert [h["path"] for h in hits] == ["a%b.mrc"], (
+            f"percent pattern broken: {hits}"
+        )
+        # glob 通配符本身仍然工作
+        hits = archive.search_files(conn, "Movies/foo*.mrc")
+        assert sorted(h["path"] for h in hits) == [
+            "Movies/foo_bar.mrc", "Movies/foobar.mrc",
+        ]
+        conn.close()
+        print("  OK  glob 搜索（字面 _ / % 正确转义）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_walk_dataset_warnings() -> None:
+    """目录软链、空目录、stat 失败都必须可见，而不是静默丢数据。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_walk_"))
+    try:
+        src = tmp / "ds"
+        src.mkdir()
+        (src / "ok.mrc").write_bytes(b"x" * 10)
+        (src / "empty").mkdir()                      # 空目录 -> 提示但不报错
+        real = tmp / "real_dir"
+        real.mkdir()
+        (real / "inside.mrc").write_bytes(b"y" * 10)
+        (src / "link").symlink_to(real, target_is_directory=True)  # 目录软链 -> 警告
+        (src / "broken").symlink_to(tmp / "nope")    # 断链 -> stat 失败
+
+        # 默认（非交互）：stat 失败必须中止，且错误里带文件路径。
+        try:
+            archive.walk_dataset(src, interactive=False)
+        except RuntimeError as exc:
+            assert "broken" in str(exc), f"error should name the bad file: {exc}"
+        else:
+            raise AssertionError("expected RuntimeError for unreadable file")
+
+        # 交互模式下操作员选择跳过：返回的清单不含坏文件，好文件保留。
+        original_confirm = archive.confirm
+        archive.confirm = lambda *a, **kw: True
+        try:
+            files = archive.walk_dataset(src)
+        finally:
+            archive.confirm = original_confirm
+        names = sorted(f[0].name for f in files)
+        assert names == ["ok.mrc"], f"unexpected file list: {names}"
+
+        # 目录软链内容（inside.mrc）确实不在清单里，且函数没因此报错。
+        assert not any("inside.mrc" in str(f[0]) for f in files)
+        print("  OK  walk_dataset（目录软链警告 / stat 失败中止或确认跳过 / 空目录提示）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_archived_file_meta_newest_wins() -> None:
+    """文件被修改后重新归档：get_archived_file_meta 应取最新版本。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_meta_"))
+    try:
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        catalog.ensure_tape(conn, "T1", archive.LTO6_RAW_BYTES)
+        ds_id = catalog.ensure_dataset(conn, "DS")
+        with catalog.transaction(conn):
+            for name, size in (("20260729_0001", 10), ("20260730_0001", 99)):
+                catalog.insert_archive(
+                    conn, name=name, archive_size=1, uncompressed_size=1,
+                    sha256="a" * 64, tape_label="T1", file_number=1,
+                )
+                catalog.add_dataset_archive(
+                    conn, ds_id, name, catalog.next_dataset_archive_sequence(conn, ds_id),
+                )
+                catalog.insert_files_batch(
+                    conn, [(name, ds_id, "a.mrc", size, "t")],
+                )
+        meta = catalog.get_archived_file_meta(conn, ds_id)
+        assert meta == {"a.mrc": (99, "t")}, f"newest version should win: {meta}"
+        # 新旧两个版本都留在目录库（磁带上确实两份都在）
+        n = conn.execute(
+            "SELECT COUNT(*) FROM file WHERE dataset_id = ? AND rel_path = 'a.mrc'",
+            (ds_id,),
+        ).fetchone()[0]
+        assert n == 2
+        conn.close()
+        print("  OK  get_archived_file_meta（重归档取最新版本，历史记录保留）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_backup_db() -> None:
+    """backup API 快照可独立打开，且只保留最近 keep 份。"""
+    import sqlite3
+
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_bak_"))
+    try:
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        catalog.ensure_tape(conn, "T1", archive.LTO6_RAW_BYTES)
+        bdir = tmp / "backups"
+        p1 = catalog.backup_db(conn, bdir, keep=2)
+        assert p1 is not None and p1.exists()
+        # 快照可以独立打开且包含数据
+        snap = sqlite3.connect(str(p1))
+        assert snap.execute("SELECT COUNT(*) FROM tape WHERE label='T1'").fetchone()[0] == 1
+        snap.close()
+        # 写入更多数据后再备份两次 -> 只保留最近 2 份
+        catalog.ensure_tape(conn, "T2", archive.LTO6_RAW_BYTES)
+        catalog.backup_db(conn, bdir, keep=2)
+        p3 = catalog.backup_db(conn, bdir, keep=2)
+        backups = sorted(bdir.glob("catalog-*.sqlite3"))
+        assert len(backups) == 2, f"keep=2 should prune old backups: {backups}"
+        snap = sqlite3.connect(str(p3))
+        assert snap.execute("SELECT COUNT(*) FROM tape").fetchone()[0] == 2
+        snap.close()
+        conn.close()
+        print("  OK  backup_db（快照可独立打开 / keep 修剪）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_rebuild_catalog_from_manifests() -> None:
+    """目录库丢失后，从磁带上的 manifest sidecar 重建记录（幂等）。"""
+    import json as _json
+    import tape as tape_mod
+
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_rb_"))
+    try:
+        mount = tmp / "ltfs"
+        mount.mkdir()
+        device = tape_mod.TapeDevice(str(mount))
+
+        # 两个 archive 的 manifest，同一盘磁带
+        for name, ds_files in (
+            ("20260729_0001", {"DS1": ["a.mrc", "b.mrc"]}),
+            ("20260729_0002", {"DS1": ["c.mrc"], "DS2": ["d.mrc"]}),
+        ):
+            file_list = [
+                {"dataset": ds, "path": f"{ds}/{rel}", "size": 10, "mtime": "t"}
+                for ds, rels in ds_files.items()
+                for rel in rels
+            ]
+            (mount / f"{name}.manifest.json").write_text(
+                _json.dumps({
+                    "manifest_version": "1.0",
+                    "project_name": "P",
+                    "tape_label": "T1",
+                    "dataset": "DS1",
+                    "datasets": [
+                        {"id": 1, "name": "DS1", "project": "P", "operator": "op", "comment": ""},
+                        {"id": 2, "name": "DS2", "project": "P", "operator": "op", "comment": ""},
+                    ],
+                    "file_list": file_list,
+                    "timestamp": "2026-07-29T00:00:00+00:00",
+                    "archive_size": 123,
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        stats = archive.rebuild_catalog_from_manifests(
+            conn, device, capacity_bytes=archive.LTO6_RAW_BYTES,
+        )
+        assert stats["archives"] == 2 and stats["files"] == 4
+        assert stats["existing_archives"] == 0
+
+        # tape/dataset/archive/file 行都恢复了；sha256 为空（manifest 里没有）
+        assert catalog.get_tape(conn, "T1") is not None
+        a1 = catalog.get_archive(conn, "20260729_0001")
+        assert a1["sha256"] == "" and a1["archive_size"] == 123
+        assert a1["file_number"] == 1
+        assert catalog.get_archive(conn, "20260729_0002")["file_number"] == 2
+        ds1 = catalog.get_dataset(conn, "DS1")
+        assert ds1 is not None and ds1["project"] == "P"
+        assert len(catalog.get_archives_for_dataset(conn, int(ds1["id"]))) == 2
+        rel_paths = {
+            r["rel_path"] for r in conn.execute("SELECT rel_path FROM file")
+        }
+        assert rel_paths == {"a.mrc", "b.mrc", "c.mrc", "d.mrc"}
+
+        # 幂等：再跑一次不重复插入
+        stats2 = archive.rebuild_catalog_from_manifests(
+            conn, device, capacity_bytes=archive.LTO6_RAW_BYTES,
+        )
+        assert stats2["archives"] == 0 and stats2["existing_archives"] == 2
+        assert conn.execute("SELECT COUNT(*) FROM file").fetchone()[0] == 4
+        conn.close()
+        print("  OK  rebuild_catalog_from_manifests（重建 + 幂等 + file_number 顺序）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_verify_archive_streaming_and_backfill() -> None:
+    """verify_archive 流式校验；sha256 为空（重建行）时校验通过后回填。"""
+    import tape as tape_mod
+
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_vfy_"))
+    try:
+        mount = tmp / "ltfs"
+        mount.mkdir()
+        device = tape_mod.TapeDevice(str(mount))
+        payload = os.urandom(300_000)
+        (mount / "X.tar.zst").write_bytes(payload)
+        real_sha = utils.sha256_file(mount / "X.tar.zst")
+
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        catalog.ensure_tape(conn, "T1", archive.LTO6_RAW_BYTES)
+        with catalog.transaction(conn):
+            catalog.insert_archive(
+                conn, name="X", archive_size=len(payload), uncompressed_size=0,
+                sha256="", tape_label="T1", file_number=1,
+            )
+        result = archive.verify_archive(conn, device, "X", assume_mounted=True)
+        assert result["ok"]
+        # 空 sha256 已回填为真实值
+        assert catalog.get_archive(conn, "X")["sha256"] == real_sha
+
+        # 记录值不符 -> 报错（流式，不落盘）
+        with catalog.transaction(conn):
+            catalog.update_archive_sha256(conn, "X", "0" * 64)
+        try:
+            archive.verify_archive(conn, device, "X", assume_mounted=True)
+        except RuntimeError as exc:
+            assert "SHA256" in str(exc)
+        else:
+            raise AssertionError("expected SHA mismatch error")
+
+        # 大小与目录库不符 -> 立刻失败
+        with catalog.transaction(conn):
+            conn.execute(
+                "UPDATE archive SET archive_size = ? WHERE name = 'X'",
+                (len(payload) + 1,),
+            )
+        try:
+            archive.verify_archive(conn, device, "X", assume_mounted=True)
+        except RuntimeError as exc:
+            assert "大小" in str(exc) or "size" in str(exc).lower()
+        else:
+            raise AssertionError("expected size mismatch error")
+        conn.close()
+        print("  OK  verify_archive（流式 / 空 sha256 回填 / 不匹配报错）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_restore_streaming_and_filtered() -> None:
+    """流式恢复：不再整包落盘，且只解出目标 dataset 的文件。"""
+    try:
+        utils.ensure_tool("zstd")
+        utils.ensure_tool("tar")
+    except RuntimeError:
+        print("  SKIP streaming restore (zstd/tar not installed)")
+        return
+
+    import tape as tape_mod
+
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_rst_"))
+    original_confirm = archive.confirm
+    original_prompt = tape_mod.prompt_for_tape_insertion
+    try:
+        # 两个 dataset 混装进同一个 archive
+        src_a = tmp / "dsA"
+        src_a.mkdir()
+        (src_a / "a.mrc").write_bytes(os.urandom(64 * 1024))
+        src_b = tmp / "dsB"
+        src_b.mkdir()
+        (src_b / "a.mrc").write_bytes(os.urandom(64 * 1024))  # 与 dsA 同名！
+        (src_b / "b.mrc").write_bytes(os.urandom(64 * 1024))
+
+        spec_a = archive.DatasetSpec(source=src_a, name="dsA", files=archive.walk_dataset(src_a))
+        spec_b = archive.DatasetSpec(source=src_b, name="dsB", files=archive.walk_dataset(src_b))
+        files = []
+        for ds_id, sp in ((1, spec_a), (2, spec_b)):
+            for p, s, m in sp.files:
+                files.append((ds_id, sp.name, p, p.relative_to(sp.source).as_posix(), s, m))
+        spec = archive.ArchiveSpec(
+            name="20260729_0001", files=files,
+            estimated_size=sum(f[4] for f in files),
+        )
+
+        mount = tmp / "ltfs"
+        mount.mkdir()
+        device = tape_mod.TapeDevice(str(mount))
+        compressed, _, sha, file_rows, _ = archive.build_and_write_archive(
+            spec, device, "T1",
+        )
+
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        catalog.ensure_tape(conn, "T1", archive.LTO6_RAW_BYTES)
+        ds_a = catalog.ensure_dataset(conn, "dsA")
+        ds_b = catalog.ensure_dataset(conn, "dsB")
+        with catalog.transaction(conn):
+            catalog.insert_archive(
+                conn, name="20260729_0001", archive_size=compressed,
+                uncompressed_size=compressed, sha256=sha,
+                tape_label="T1", file_number=1,
+            )
+            catalog.add_dataset_archive(conn, ds_a, "20260729_0001", 1)
+            catalog.add_dataset_archive(conn, ds_b, "20260729_0001", 1)
+            catalog.insert_files_batch(
+                conn, [("20260729_0001", d, r, s, m) for d, r, s, m in file_rows],
+            )
+
+        archive.confirm = lambda *a, **kw: True
+        tape_mod.prompt_for_tape_insertion = lambda label: label
+
+        dest = tmp / "out"
+        archive.restore_dataset(conn, device, "dsA", dest)
+        # 只有 dsA 的文件被解出；dsB（包括与 dsA 同名的 a.mrc）不在
+        assert (dest / "dsA" / "a.mrc").exists()
+        assert not (dest / "dsB").exists(), "restore must not extract other datasets' files"
+
+        # SHA 不符（翻转一个字节，保持大小一致以通过大小预检）
+        # -> 报错并清掉本次解出的内容。损坏可能先在 zstd/tar 环节暴露，
+        # 也可能撑到 SHA 比对才暴露 -- 两者都是正确的失败路径。
+        arch_file = mount / "20260729_0001.tar.zst"
+        corrupted = bytearray(arch_file.read_bytes())
+        corrupted[0] ^= 0xFF
+        arch_file.write_bytes(bytes(corrupted))
+        dest2 = tmp / "out2"
+        try:
+            archive.restore_dataset(conn, device, "dsA", dest2)
+        except RuntimeError:
+            pass  # tar/zstd/SHA 任一环节失败都是正确行为（数据已损坏）
+        else:
+            raise AssertionError("expected failure on corrupted archive")
+        assert not (dest2 / "dsA").exists(), "failed restore must clean up"
+        conn.close()
+        print("  OK  流式恢复（不落盘 / 按 dataset 过滤 / SHA 失败清理）")
+    finally:
+        archive.confirm = original_confirm
+        tape_mod.prompt_for_tape_insertion = original_prompt
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
 def main() -> int:
     print("CryoEM archive smoke tests")
     print("=" * 60)
@@ -635,11 +1069,19 @@ def main() -> int:
     test_catalog_crud()
     test_transaction_is_reentrant()
     test_resume_skips_archived_files()
+    test_file_table_migration()
+    test_search_like_escape()
+    test_walk_dataset_warnings()
+    test_archived_file_meta_newest_wins()
+    test_backup_db()
+    test_rebuild_catalog_from_manifests()
+    test_verify_archive_streaming_and_backfill()
     test_incomplete_archive_removed_on_failure()
     test_archive_contains_real_data()
     test_manifest_sidecar_written()
     test_export_to_csv()
     test_dynamic_create_archives_loop()
+    test_restore_streaming_and_filtered()
     print("=" * 60)
     print("all smoke tests passed")
     return 0

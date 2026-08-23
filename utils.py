@@ -72,19 +72,24 @@ def sha256_bytes(data: bytes) -> str:
 
 
 def format_bytes(n: int) -> str:
-    """Format byte count as a human-readable string (binary units)."""
+    """Format byte count as a human-readable string (decimal units).
+
+    十进制单位（1 KB = 1000 B）：与项目所有容量常量（LTO6_RAW_BYTES、
+    CHUNK_MULTIPLE_BYTES、SAFE_MARGIN_BYTES…）以及磁带厂商的标称容量同一
+    口径。曾用二进制单位（KiB/GiB），操作员拿显示值对磁带容量时会差 ~10%。
+    """
     n = int(n)
     if n < 0:
         raise ValueError(f"size must be non-negative, got {n}")
-    if n < 1024:
+    if n < 1000:
         return f"{n} B"
-    units = ("KiB", "MiB", "GiB", "TiB", "PiB")
+    units = ("KB", "MB", "GB", "TB", "PB")
     v = float(n)
     for unit in units:
-        v /= 1024.0
-        if v < 1024.0:
+        v /= 1000.0
+        if v < 1000.0:
             return f"{v:.2f} {unit}"
-    return f"{v:.2f} PiB"
+    return f"{v:.2f} PB"
 
 
 def now_iso() -> str:

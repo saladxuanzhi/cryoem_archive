@@ -47,7 +47,17 @@ LTFS_MOUNT_DEFAULT: str = "/mnt/ltfs"
 """Where the tape is mounted. Archives are written as files directly here."""
 
 LTO6_CAPACITY: int = archive.LTO6_RAW_BYTES     # 2.5 TB
-"""Tape raw capacity. Used when creating a new tape row."""
+"""Tape raw capacity. Used when creating a new tape row.
+
+注意这是磁带**裸容量**（厂商标称）：LTFS 格式化 + 索引开销后实际可用约少
+10%（~2.2TB）。该值只用于台账记录与展示，写入决策一律以
+``TapeDevice.free_bytes()`` 的实测剩余空间为准，所以偏大不会导致写满。
+"""
+
+BACKUP_DIR: Path = DATA_DIR / "backups"
+"""目录库自动备份目录：每成功写入一个 archive 快照一次，保留最近
+:data:`catalog.BACKUP_KEEP` 份。目录库是整套归档的唯一完整索引
+（磁带上的 manifest sidecar 缺 sha256），丢了它恢复/校验都会很麻烦。"""
 
 
 # ============================================================================
@@ -64,6 +74,7 @@ MENU = """
   4 校验磁带
   5 查看台账
   6 导出台账 (CSV)
+  7 重建目录库（从磁带 manifest）
   0 退出
 ========================================
 """
@@ -199,6 +210,8 @@ def main(argv: list[str] | None = None) -> int:
                     do_show_catalog(conn, logger)
                 elif choice == "6":
                     do_export_csv(conn, logger)
+                elif choice == "7":
+                    do_rebuild_catalog(conn, device, logger)
                 elif choice == "0":
                     print("再见。")
                     return 0
@@ -281,6 +294,7 @@ def do_create_prefilled(
         [spec],
         tape_label=tape_label,
         capacity_bytes=LTO6_CAPACITY,
+        backup_dir=BACKUP_DIR,
     )
 
     print()
@@ -299,7 +313,7 @@ def do_create_prefilled(
 
 
 def do_create(conn, device: tape.TapeDevice, logger: logging.Logger) -> None:
-    """Menu item 1: pack one or more Datasets into 100 GB archives."""
+    """Menu item 1: pack one or more Datasets into dynamically-sized archives."""
     print("[1] 创建 Archives")
     print("-" * 60)
 
@@ -337,6 +351,7 @@ def do_create(conn, device: tape.TapeDevice, logger: logging.Logger) -> None:
             datasets,
             tape_label=tape_label,
             capacity_bytes=LTO6_CAPACITY,
+            backup_dir=BACKUP_DIR,
         )
     except Exception:
         logger.exception("create_archives failed")
@@ -534,6 +549,42 @@ def do_export_csv(conn, logger: logging.Logger) -> None:
     for p in paths:
         size = p.stat().st_size if p.exists() else 0
         print(f"    - {p.name:<20} ({format_bytes(size)})")
+    press_enter()
+
+
+def do_rebuild_catalog(
+    conn, device: tape.TapeDevice, logger: logging.Logger
+) -> None:
+    """Menu item 7: rebuild catalog rows from manifest sidecars on the mounted tape.
+
+    目录库丢失/损坏后的兜底：manifest sidecar 含 datasets/file_list/
+    tape_label/archive_size/timestamp，唯独没有 sha256 -- 重建后对每盘磁带
+    跑一次「校验磁带」（菜单 4）即可回填。已存在的记录不会被覆盖，逐盘
+    磁带重复执行本命令是安全的。
+    """
+    print("[7] 重建目录库（从磁带 manifest）")
+    print("-" * 60)
+    print(f"  将扫描 {_ltfs_mount} 下的 *.manifest.json。")
+    print("  请确认当前挂载的就是要重建的磁带；多盘磁带请逐盘挂载、逐盘执行。")
+    if not confirm("继续？", default=False):
+        print("  已取消。")
+        return
+    try:
+        stats = archive.rebuild_catalog_from_manifests(
+            conn, device, capacity_bytes=LTO6_CAPACITY
+        )
+    except Exception:
+        logger.exception("rebuild_catalog_from_manifests failed")
+        raise
+    print()
+    print(
+        f"  ✓ 重建完成：磁带 {stats['tapes']}、Dataset {stats['datasets']}、"
+        f"archive {stats['archives']}（已存在跳过 {stats['existing_archives']}）、"
+        f"文件 {stats['files']} 条。"
+    )
+    if stats["archives"]:
+        print("  提示：重建的 archive 尚无 SHA256 记录，请对该磁带执行")
+        print("        「4 校验磁带」完成校验并自动回填。")
     press_enter()
 
 

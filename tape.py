@@ -118,6 +118,39 @@ class TapeDevice:
             if not fh.closed:
                 fh.close()
 
+    def open_archive(self, archive_name: str, *, expected_bytes: int | None = None) -> IO[bytes]:
+        """Open ``<mount>/<archive_name>`` for streaming reads.
+
+        不再把整个 archive 拷到本地磁盘（旧 :func:`read_archive` 的做法--
+        单包可达 ~1TB，本地盘往往装不下）。``expected_bytes`` 给出时先做
+        一次廉价的 stat 比对，大小不符立刻失败，避免白读几小时磁带。
+        """
+        src = self._mount_path() / archive_name
+        if not src.exists():
+            raise FileNotFoundError(f"LTFS: 磁带上没有 {archive_name}（{src}）")
+        if expected_bytes is not None:
+            actual = src.stat().st_size
+            if actual != expected_bytes:
+                raise RuntimeError(
+                    f"LTFS 文件大小不符：{archive_name} 实际 {actual}，"
+                    f"目录库记录 {expected_bytes}"
+                )
+        _LOGGER.info("LTFS: streaming %s", src)
+        return open(src, "rb")
+
+    def hash_archive(self, archive_name: str) -> str:
+        """SHA256 of an archive on tape, streamed (no local copy)."""
+        import hashlib
+
+        h = hashlib.sha256()
+        with self.open_archive(archive_name) as fh:
+            while True:
+                block = fh.read(8 * 1024 * 1024)
+                if not block:
+                    break
+                h.update(block)
+        return h.hexdigest()
+
     def read_archive(
         self, dest: Path, expected_bytes: int, *, archive_name: str
     ) -> None:

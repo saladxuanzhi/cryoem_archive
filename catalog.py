@@ -23,6 +23,7 @@ import logging
 import re
 import sqlite3
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 
 from utils import now_iso
@@ -71,7 +72,10 @@ CREATE TABLE IF NOT EXISTS file (
     rel_path     TEXT    NOT NULL,
     size         INTEGER NOT NULL,
     mtime        TEXT    NOT NULL,
-    PRIMARY KEY (archive_name, rel_path)
+    -- 主键含 dataset_id：一个 archive 可混装多个 dataset，不同 dataset 的
+    -- 内部相对路径完全可能相同（如都有 Movies/000001.mrc）。
+    -- v1 schema 误用 (archive_name, rel_path)，见 :func:`_migrate_file_table`。
+    PRIMARY KEY (archive_name, dataset_id, rel_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_dataset_archive_order ON dataset_archive(dataset_id, sequence);
@@ -83,14 +87,108 @@ CREATE INDEX IF NOT EXISTS idx_file_dataset          ON file(dataset_id);
 
 
 def open_db(path: str) -> sqlite3.Connection:
-    """Open (or create) the catalog database. Apply schema if missing."""
+    """Open (or create) the catalog database. Apply schema if missing.
+
+    旧库（v1，``file`` 主键为 ``(archive_name, rel_path)``）会在打开时被
+    原地迁移到 v2（主键含 ``dataset_id``）。迁移只动 SQLite 文件，不涉及
+    任何磁带上的数据；已有行全部满足新主键约束，拷贝是无损的。
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    _migrate_file_table(conn)
     return conn
+
+
+_FILE_TABLE_PK_COLUMNS = ("archive_name", "dataset_id", "rel_path")
+
+
+def _file_table_pk(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Return the current PK column order of ``file``, in key order."""
+    rows = conn.execute("PRAGMA table_info(file)").fetchall()
+    pk_cols = [(int(r["pk"]), r["name"]) for r in rows if int(r["pk"]) > 0]
+    return tuple(name for _, name in sorted(pk_cols))
+
+
+def _migrate_file_table(conn: sqlite3.Connection) -> None:
+    """v1 -> v2: rebuild ``file`` with the ``(archive, dataset, rel_path)`` PK.
+
+    SQLite 不能 ALTER 主键，所以走「建新表 -> 拷贝 -> 换名」三步。``file``
+    是叶子表（没有别的表引用它），DROP 不影响外键。旧主键 (archive_name,
+    rel_path) 比新主键更严格，因此拷贝永不违反新约束。
+    """
+    if _file_table_pk(conn) == _FILE_TABLE_PK_COLUMNS:
+        return  # 已是 v2（或全新建库，executescript 用的就是 v2 定义）
+    old_pk = _file_table_pk(conn)
+    _LOGGER.info("migrating file table PK: %s -> %s", old_pk, _FILE_TABLE_PK_COLUMNS)
+    with transaction(conn):
+        conn.execute("DROP INDEX IF EXISTS idx_file_dataset")
+        conn.execute(
+            """
+            CREATE TABLE file_v2 (
+                archive_name TEXT    NOT NULL REFERENCES archive(name) ON DELETE CASCADE,
+                dataset_id   INTEGER NOT NULL REFERENCES dataset(id)   ON DELETE CASCADE,
+                rel_path     TEXT    NOT NULL,
+                size         INTEGER NOT NULL,
+                mtime        TEXT    NOT NULL,
+                PRIMARY KEY (archive_name, dataset_id, rel_path)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO file_v2 (archive_name, dataset_id, rel_path, size, mtime) "
+            "SELECT archive_name, dataset_id, rel_path, size, mtime FROM file"
+        )
+        conn.execute("DROP TABLE file")
+        conn.execute("ALTER TABLE file_v2 RENAME TO file")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_dataset ON file(dataset_id)"
+        )
+
+
+# --- backup -------------------------------------------------------------------
+
+
+BACKUP_KEEP: int = 10
+"""自动备份保留的最近份数（每写一个 archive 备份一次，目录库 ~1MB 级）。"""
+
+
+def backup_db(conn: sqlite3.Connection, backup_dir: Path, *, keep: int = BACKUP_KEEP) -> Path | None:
+    """用 sqlite3 backup API 把目录库快照到 ``backup_dir``，保留最近 ``keep`` 份。
+
+    目录库是整套归档的唯一索引：磁带上的 manifest sidecar 只能部分重建它
+    （缺 sha256），所以每次成功入库后都留一份快照。backup API 在连接打开
+    状态下也是一致的（相当于 VACUUM INTO 的语义）。
+    """
+    import shutil as _shutil
+
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dest = backup_dir / f"catalog-{stamp}.sqlite3"
+        i = 0
+        while dest.exists():  # 同一秒内多次备份
+            i += 1
+            dest = backup_dir / f"catalog-{stamp}-{i}.sqlite3"
+        dst = sqlite3.connect(str(dest))
+        try:
+            conn.backup(dst)
+        finally:
+            dst.close()
+        # 只保留最近 keep 份
+        backups = sorted(backup_dir.glob("catalog-*.sqlite3"))
+        for old in backups[:-keep] if keep > 0 else []:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return dest
+    except (OSError, sqlite3.Error) as exc:
+        _LOGGER.warning("catalog backup failed: %s", exc)
+        return None
 
 
 _SAVEPOINT_SEQ = itertools.count(1)
@@ -232,12 +330,10 @@ def ensure_tape(
                 "UPDATE tape SET last_used = ?, status = ? WHERE label = ?",
                 (now, status, label),
             )
-        if status == "in_use":
-            # One drive, one loaded tape: nothing else can still be in use.
-            conn.execute(
-                "UPDATE tape SET status = 'full' WHERE status = 'in_use' AND label != ?",
-                (label,),
-            )
+    # 注意：不把其它 in_use 磁带改标 full。上次运行被中断时，被换出的磁带
+    # 可能仍有剩余空间（状态还是 in_use）；一刀切标满会让台账失真，且它
+    # 再也不会被 find_in_use_tape 推荐。真正写满的磁带在换带路径上由调用
+    # 方显式 set_tape_status 处理。
 
 
 def set_tape_status(conn: sqlite3.Connection, label: str, status: str) -> None:
@@ -334,6 +430,19 @@ def insert_archive(
     )
 
 
+def update_archive_sha256(
+    conn: sqlite3.Connection, name: str, sha256: str
+) -> None:
+    """Backfill an archive's SHA256（重建目录库时 manifest 里没有它）。
+
+    由 :func:`archive.verify_archive` 在校验通过后调用：从 manifest 重建
+    的行 sha256 为空串，首次校验即回填真实值。Caller owns the transaction.
+    """
+    conn.execute(
+        "UPDATE archive SET sha256 = ? WHERE name = ?", (sha256, name)
+    )
+
+
 # --- dataset_archive CRUD -----------------------------------------------------
 
 
@@ -392,6 +501,30 @@ def get_archived_rel_paths(conn: sqlite3.Connection, dataset_id: int) -> set[str
     }
 
 
+def get_archived_file_meta(
+    conn: sqlite3.Connection, dataset_id: int
+) -> dict[str, tuple[int, str]]:
+    """``rel_path -> (size, mtime)`` for every file already on tape.
+
+    比 :func:`get_archived_rel_paths` 多带 size/mtime：续传时不但要跳过
+    已归档的路径，还要发现「路径相同但内容已变」的文件（归档后被修改），
+    这类文件需要重新归档，而不是被路径去重永久跳过。
+
+    同一 ``rel_path`` 可能出现在多个 archive（文件被修改后重新归档）；
+    按归档时间倒序取第一条，即最新版本。
+    """
+    meta: dict[str, tuple[int, str]] = {}
+    rows = conn.execute(
+        "SELECT f.rel_path, f.size, f.mtime "
+        "FROM file f JOIN archive a ON a.name = f.archive_name "
+        "WHERE f.dataset_id = ? ORDER BY a.name DESC",
+        (dataset_id,),
+    )
+    for row in rows:
+        meta.setdefault(row["rel_path"], (int(row["size"]), row["mtime"]))
+    return meta
+
+
 # --- file CRUD ----------------------------------------------------------------
 
 
@@ -439,7 +572,13 @@ def search_files(
 ) -> list[sqlite3.Row]:
     """Return rows whose ``rel_path`` matches the SQL ``LIKE`` pattern.
 
-    Translation from shell glob to ``LIKE`` happens in :mod:`archive`.
+    Translation from shell glob to ``LIKE`` happens in :mod:`archive`. The
+    pattern uses ``\\`` as the escape character (see
+    :func:`archive.glob_to_sql_like`), so the ``ESCAPE`` clause here is
+    mandatory: SQLite's LIKE has **no** default escape, and without the
+    clause a translated ``\\_`` would match a literal backslash followed by
+    any character -- silently breaking every search for filenames
+    containing ``_``.
     """
     sql = (
         "SELECT f.archive_name, f.dataset_id, f.rel_path, f.size, f.mtime, "
@@ -447,7 +586,7 @@ def search_files(
         "FROM file f "
         "JOIN dataset d ON d.id = f.dataset_id "
         "JOIN archive a ON a.name = f.archive_name "
-        "WHERE f.rel_path LIKE ?"
+        "WHERE f.rel_path LIKE ? ESCAPE '\\'"
     )
     args: list = [pattern_sql]
     if dataset_name is not None:

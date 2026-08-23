@@ -63,3 +63,6 @@ catalog.sqlite3
 *.sqlite3-journal
 *.sqlite3-wal
 *.sqlite3-shm
+
+# Local catalog data (DB, logs, backups)
+data/

@@ -4,7 +4,7 @@ Design:
 
 * An **Archive** is one ``.tar.zst`` written to tape in a single pass.
   Its size is decided **dynamically** by :func:`calculate_chunk_size` from
-  the tape's remaining free space (50 GB 向下取整 / 20 GB 安全区间) —
+  the tape's remaining free space (50 GB 向下取整 / 40 GB 安全区间) —
   no fixed 100 GB chunks anymore.
 * A **Dataset** is a user-facing group of files. A dataset may span
   several archives (if it is large), and an archive may contain files
@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -50,9 +51,6 @@ from utils import (
     ensure_tool,
     format_bytes,
     now_iso,
-    progress,
-    progress_done,
-    sha256_file,
 )
 
 _LOGGER = logging.getLogger("cryoem_archive")
@@ -103,30 +101,32 @@ def calculate_chunk_size(
     1. 将 ``remaining_space`` 向下取整到 :data:`CHUNK_MULTIPLE_BYTES`（默认 50GB）
        的整数倍，记作 ``rounded``。
     2. 计算 ``leftover = remaining_space - rounded``。
-       如果 ``leftover`` < :data:`SAFE_MARGIN_BYTES`（默认 20GB），则说明留出的空隙
+       如果 ``leftover`` < :data:`SAFE_MARGIN_BYTES`（默认 40GB），则说明留出的空隙
        不够安全，再减去一个 ``multiple``（退一档）。
     3. 如果最终 ``rounded`` < ``multiple``（即剩余空间不足 50GB），返回 0；
        调用方应触发换磁带，而不是带 TargetSize=0 进入循环造成死循环。
 
     Args:
         remaining_space: 磁带剩余空间（bytes，函数内部换算为 GB 以避免大整数精度问题）。
-        safe_margin: 切分包写完后磁带应保留的最小安全区间（bytes，默认 20GB）。
+        safe_margin: 切分包写完后磁带应保留的最小安全区间（bytes，默认 40GB，
+            见 :data:`SAFE_MARGIN_BYTES`。注意需求原文档的示例按 20GB 计算，
+            项目常量后来收紧到 40GB -- 以常量为准）。
         multiple: 切分基数（bytes，默认 50GB），同时也是最小可切分包尺寸。
 
     Returns:
         下一个 archive 的目标大小（bytes）。返回 0 表示剩余空间不足触发换磁带。
 
     Examples:
-        >>> # 973 GB -> 950 GB  (leftover 23 >= 20，安全)
-        >>> calculate_chunk_size(973 * 1_000_000_000) == 950 * 1_000_000_000
+        >>> # 973 GB -> 900 GB  (leftover 23 < 40，再退一档)
+        >>> calculate_chunk_size(973 * 1_000_000_000) == 900 * 1_000_000_000
         True
-        >>> # 960 GB -> 900 GB  (leftover 10 < 20，再退一档)
+        >>> # 960 GB -> 900 GB  (leftover 10 < 40，再退一档)
         >>> calculate_chunk_size(960 * 1_000_000_000) == 900 * 1_000_000_000
         True
-        >>> # 125 GB -> 100 GB
-        >>> calculate_chunk_size(125 * 1_000_000_000) == 100 * 1_000_000_000
+        >>> # 125 GB ->  50 GB  (leftover 25 < 40，退一档)
+        >>> calculate_chunk_size(125 * 1_000_000_000) ==  50 * 1_000_000_000
         True
-        >>> # 115 GB ->  50 GB  (leftover 15 < 20，退一档)
+        >>> # 115 GB ->  50 GB  (leftover 15 < 40，退一档)
         >>> calculate_chunk_size(115 * 1_000_000_000) ==  50 * 1_000_000_000
         True
         >>> # 60 GB -> 0  (不足以切出 50GB 安全包)
@@ -164,7 +164,8 @@ def calculate_chunk_size(
 
 @dataclass
 class ArchiveManifest:
-    """Manifest 元数据，写入 sidecar 文件 ``<archive>.tar.zst.manifest.json``。
+    """Manifest 元数据，写入 sidecar 文件 ``<archive_name>.manifest.json``
+    （与 ``<archive_name>.tar.zst`` 同目录，见 :func:`_write_manifest_sidecar`）。
 
     字段含义：
 
@@ -286,15 +287,36 @@ class ArchiveSpec:
 # --- discovery ---------------------------------------------------------------
 
 
-def walk_dataset(source: Path) -> list[tuple[Path, int, str]]:
+def walk_dataset(source: Path, *, interactive: bool = True) -> list[tuple[Path, int, str]]:
     """Walk ``source`` and return ``[(abs_path, size, mtime_iso), ...]``.
 
     Sorted, hidden files skipped. Used by the packing algorithm to know
     what goes into the archive.
+
+    扫描阶段的可见性（旧版全部静默，这里补齐 -- 对归档工具来说，「静默
+    少了数据」比「报错停下」危险得多）：
+
+    * **目录符号链接既不跟随也不入档**（``os.walk`` 默认不进入；跟随会有
+      循环风险）。扫描结束会明确列出这些链接，操作员可以决定是否整理源
+      目录后重新归档。
+    * stat 失败的文件（权限、断链等）**先收集完整清单再一次性报告**：
+      默认中止；``interactive=True`` 时询问操作员是否跳过它们继续。
+    * 空目录不产生任何 tar 条目（本工具只归档文件），结束时给出计数。
     """
     out: list[tuple[Path, int, str]] = []
+    stat_errors: list[tuple[Path, OSError]] = []
+    skipped_dir_links: list[Path] = []
+    empty_dirs: list[str] = []
+
     for dirpath, dirnames, filenames in os.walk(source):
+        here = Path(dirpath)
+        for d in dirnames:
+            if (here / d).is_symlink():
+                skipped_dir_links.append(here / d)
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        visible_files = [f for f in filenames if not f.startswith(".")]
+        if not visible_files and not dirnames:
+            empty_dirs.append(dirpath)
         for fname in sorted(filenames):
             if fname.startswith("."):
                 continue
@@ -302,11 +324,37 @@ def walk_dataset(source: Path) -> list[tuple[Path, int, str]]:
             try:
                 st = p.stat()
             except OSError as exc:
-                raise RuntimeError(f"stat failed: {p}: {exc}") from exc
+                stat_errors.append((p, exc))
+                continue
             mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(
                 timespec="seconds"
             )
             out.append((p, st.st_size, mtime))
+
+    if empty_dirs:
+        print(f"  注意：{len(empty_dirs)} 个空目录不会归档（工具只归档文件）。")
+    if skipped_dir_links:
+        print(
+            f"  ⚠ {len(skipped_dir_links)} 个目录符号链接不会被跟随，"
+            f"其内容不会进入 archive："
+        )
+        for p in skipped_dir_links[:10]:
+            print(f"      {p}")
+        if len(skipped_dir_links) > 10:
+            print(f"      ... 等共 {len(skipped_dir_links)} 个")
+    if stat_errors:
+        print(f"  ⚠ {len(stat_errors)} 个文件无法读取：")
+        for p, exc in stat_errors[:10]:
+            print(f"      {p}: {exc}")
+        if len(stat_errors) > 10:
+            print(f"      ... 等共 {len(stat_errors)} 个")
+        if not (interactive and confirm("跳过这些文件继续归档？", default=False)):
+            first_path, first_exc = stat_errors[0]
+            raise RuntimeError(
+                f"stat 失败：{len(stat_errors)} 个文件"
+                f"（首个：{first_path}: {first_exc}）。"
+                f"已中止，未写入任何数据。"
+            )
     return out
 
 
@@ -603,6 +651,8 @@ def create_archives(
     datasets: list[DatasetSpec],
     tape_label: str,
     capacity_bytes: int,
+    *,
+    backup_dir: Path | None = None,
 ) -> list[dict]:
     """动态切分打包 datasets 并写入磁带（需求 1 的重构主入口）。
 
@@ -621,6 +671,10 @@ def create_archives(
     * dataset 行入库与续传（续传以 catalog 为准）；
     * 单个 archive 失败或 catalog 失败时回收 orphan 文件；
     * 任何 archive 都不能跨磁带。
+
+    Args:
+        backup_dir: 每成功入库一个 archive 后，把目录库快照到该目录
+            （保留最近 :data:`catalog.BACKUP_KEEP` 份）。``None`` 跳过。
     """
     if not datasets:
         raise RuntimeError("至少需要一个 Dataset")
@@ -648,16 +702,39 @@ def create_archives(
         dataset_lookup[ds_id] = spec
 
     # 2b) Resume: drop files an earlier run already committed to tape.
+    #     比对 (size, mtime) 而不是只看路径：归档后被修改过的文件（同名
+    #     同路径、内容已变）必须重新归档，否则会被路径去重永久跳过。
     resumed = 0
+    rearchive_total = 0
     for ds_id, spec in dataset_ids:
-        done = catalog.get_archived_rel_paths(conn, ds_id)
-        if not done:
+        archived = catalog.get_archived_file_meta(conn, ds_id)
+        if not archived:
             continue
-        kept = [
-            f for f in spec.files
-            if f[0].relative_to(spec.source).as_posix() not in done
-        ]
-        skipped = len(spec.files) - len(kept)
+        kept = []
+        skipped = 0
+        changed: list[Path] = []
+        for f in spec.files:
+            rel = f[0].relative_to(spec.source).as_posix()
+            rec = archived.get(rel)
+            if rec is None:
+                kept.append(f)
+            elif rec != (f[1], f[2]):
+                # 路径已在磁带上，但 size/mtime 与目录库记录不符 -> 重新归档。
+                # 旧记录保留（磁带上确实有旧版本），新行落到新的 archive。
+                changed.append(f[0])
+                kept.append(f)
+            else:
+                skipped += 1
+        if changed:
+            rearchive_total += len(changed)
+            print(
+                f"  ⚠ {spec.name}：{len(changed)} 个文件与目录库记录的 "
+                f"size/mtime 不符（归档后被修改过），将重新归档："
+            )
+            for p in changed[:5]:
+                print(f"      {p}")
+            if len(changed) > 5:
+                print(f"      ... 等共 {len(changed)} 个")
         if skipped:
             resumed += skipped
             print(
@@ -845,6 +922,13 @@ def create_archives(
                 pass
             raise
 
+        # 目录库是这套归档的唯一完整索引（磁带上的 manifest 缺 sha256），
+        # 每成功入库一个 archive 就快照一份。
+        if backup_dir is not None:
+            backup_path = catalog.backup_db(conn, backup_dir)
+            if backup_path is not None:
+                _LOGGER.info("catalog backup -> %s", backup_path)
+
         written.append({
             "name": spec.name,
             "tape_label": current_tape,
@@ -909,11 +993,23 @@ def restore_dataset(
     dataset_name: str,
     dest_dir: Path,
 ) -> Path:
-    """Restore a dataset by reading all its archives in sequence."""
+    """Restore a dataset by streaming all its archives from tape.
+
+    恢复不再把整个 archive 拷到本地磁盘（单包动态切分可达 ~950GB，本地盘
+    往往装不下）：LTFS 文件 -> 边读边算 SHA256 -> ``zstd -d`` -> ``tar -x``，
+    全程只有一次磁带顺序读。
+
+    tar 成员按目录库过滤，只解出该 dataset 自己的文件 -- 一个 archive 可能
+    混装多个小 dataset，整包解压会把别人的文件也倒进目标目录。
+
+    SHA256 不符时删除本次解出的内容再报错，与旧行为「校验失败则不解压」
+    保持同等的数据完整性语义。
+    """
     dataset = catalog.get_dataset(conn, dataset_name)
     if dataset is None:
         raise KeyError(f"目录库中没有 Dataset {dataset_name!r}")
-    archives = catalog.get_archives_for_dataset(conn, int(dataset["id"]))
+    ds_id = int(dataset["id"])
+    archives = catalog.get_archives_for_dataset(conn, ds_id)
     if not archives:
         raise RuntimeError(f"Dataset {dataset_name!r} 在目录库中没有关联任何 archive。")
 
@@ -929,6 +1025,7 @@ def restore_dataset(
 
     zstd = ensure_tool("zstd")
     tar = ensure_tool("tar")
+    dataset_dir = dest_dir / dataset_name
 
     current_tape: str | None = None
     for i, a in enumerate(archives, 1):
@@ -939,55 +1036,136 @@ def restore_dataset(
         print(
             f"  [{i}/{len(archives)}] 读取 {a['name']} 磁带 {a['tape_label']} ..."
         )
-        with tempfile.TemporaryDirectory(prefix="cryoem_restore_") as tmp:
-            staging = Path(tmp) / f"{a['name']}.tar.zst"
-            device.read_archive(
-                staging,
-                expected_bytes=int(a["archive_size"]),
-                archive_name=f"{a['name']}.tar.zst",
-            )
-            # Verify SHA256
-            progress(f"SHA256 {a['name']}", 0, 1)
-            actual_sha = sha256_file(staging)
-            if actual_sha.lower() != a["sha256"].lower():
-                progress_done()
-                raise RuntimeError(
-                    f"SHA256 校验失败：{a['name']} 磁带读到 {actual_sha}，"
-                    f"目录库记录 {a['sha256']}"
-                )
-            progress_done(f"SHA256 {a['name']} OK")
-
-            # Extract
-            print(f"        解压到 {dest_dir} ...")
-            try:
-                with open(staging, "rb") as src_fh:
-                    zstd_proc = subprocess.Popen(
-                        [zstd, "-T0", "-q", "-d", "-c"],
-                        stdin=src_fh, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    )
-            except FileNotFoundError as exc:
-                raise RuntimeError(f"zstd not found: {exc}") from exc
-            if zstd_proc.stdout is None:
-                raise RuntimeError("zstd produced no stdout")
-            try:
-                tar_proc = subprocess.Popen(
-                    [tar, "-xf", "-", "-C", str(dest_dir)],
-                    stdin=zstd_proc.stdout, stderr=subprocess.PIPE,
-                )
-            except FileNotFoundError as exc:
-                zstd_proc.kill()
-                raise RuntimeError(f"tar not found: {exc}") from exc
-            finally:
-                zstd_proc.stdout.close()
-            _, tar_err = tar_proc.communicate()
-            zstd_proc.wait()
-            if tar_proc.returncode != 0:
-                raise RuntimeError(
-                    f"tar extract failed: {tar_err.decode('utf-8', errors='replace')}"
-                )
+        _restore_one_archive(
+            conn,
+            device,
+            a,
+            ds_id=ds_id,
+            dataset_name=dataset_name,
+            dest_dir=dest_dir,
+            dataset_dir=dataset_dir,
+            zstd=zstd,
+            tar=tar,
+        )
 
     print(f"  ✓ Dataset {dataset_name} 已恢复到 {dest_dir}")
     return dest_dir
+
+
+def _restore_one_archive(
+    conn,
+    device: tape.TapeDevice,
+    a,
+    *,
+    ds_id: int,
+    dataset_name: str,
+    dest_dir: Path,
+    dataset_dir: Path,
+    zstd: str,
+    tar: str,
+) -> None:
+    """流式解出一个 archive 中属于该 dataset 的文件，并校验其 SHA256。
+
+    管线（只有一个泵线程不需要：我们只驱动 zstd 的 stdin，tar 直接从
+    zstd 的 stdout 读，读端不会被同一个线程堵死）::
+
+        LTFS 文件 -> (本函数泵送+哈希) -> zstd -d -c -> tar -x -T <成员表>
+    """
+    members = [
+        f"{dataset_name}/{row['rel_path']}"
+        for row in conn.execute(
+            "SELECT rel_path FROM file WHERE archive_name = ? AND dataset_id = ?",
+            (a["name"], ds_id),
+        )
+    ]
+    if not members:
+        raise RuntimeError(
+            f"archive {a['name']} 中没有 Dataset {dataset_name!r} 的文件记录，"
+            f"无法按成员过滤解压。"
+        )
+
+    expected = int(a["archive_size"])
+    src = device.open_archive(f"{a['name']}.tar.zst", expected_bytes=expected)
+    digest = hashlib.sha256()
+    bar = ByteProgress(f"读取 {a['name']}", expected)
+    read_bytes = 0
+    start = time.time()
+    try:
+        with tempfile.TemporaryDirectory(prefix="cryoem_restore_") as tmp:
+            # tar 成员名单：NUL 分隔以兼容任何文件名字符。名单本身只有
+            # 几百 KB，落临时文件是安全的（大数据从不落盘）。
+            list_path = Path(tmp) / "members.null"
+            list_path.write_bytes(
+                b"\0".join(m.encode("utf-8") for m in members) + b"\0"
+            )
+            with tempfile.TemporaryFile() as zstd_err, tempfile.TemporaryFile() as tar_err:
+                zstd_proc = subprocess.Popen(
+                    [zstd, "-T0", "-q", "-d", "-c"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=zstd_err,
+                )
+                assert zstd_proc.stdin is not None and zstd_proc.stdout is not None
+                try:
+                    tar_proc = subprocess.Popen(
+                        [
+                            tar, "-xf", "-", "-C", str(dest_dir),
+                            "--null", "-T", str(list_path),
+                        ],
+                        stdin=zstd_proc.stdout,
+                        stderr=tar_err,
+                    )
+                except FileNotFoundError as exc:
+                    zstd_proc.kill()
+                    raise RuntimeError(f"tar not found: {exc}") from exc
+                finally:
+                    zstd_proc.stdout.close()
+                try:
+                    while True:
+                        chunk = src.read(STREAM_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        digest.update(chunk)
+                        read_bytes += len(chunk)
+                        bar.update(read_bytes)
+                        zstd_proc.stdin.write(chunk)
+                    zstd_proc.stdin.close()
+                except BrokenPipeError:
+                    # tar 提前退出（如目标磁盘满）会让 zstd 关闭 stdout；
+                    # 具体原因由下面的返回码与 stderr 给出。
+                    pass
+                zstd_rc = zstd_proc.wait()
+                tar_rc = tar_proc.wait()
+                if tar_rc != 0:
+                    raise RuntimeError(
+                        f"tar 解压失败：{_read_temp(tar_err)}"
+                    )
+                if zstd_rc != 0:
+                    raise RuntimeError(
+                        f"zstd 解压失败 (rc={zstd_rc})：{_read_temp(zstd_err)}"
+                    )
+    except BaseException:
+        # 校验或解压中途失败：清掉本次已解出的内容，目标目录回到接近
+        # 调用前的状态（尽力而为，删不掉的残留会在异常信息之外由日志记录）。
+        _LOGGER.exception("restore of archive %s failed", a["name"])
+        if dataset_dir.exists():
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+        raise
+    finally:
+        src.close()
+
+    bar.done(
+        f"读取 {a['name']}  {format_bytes(read_bytes)} ({time.time() - start:.1f}s)",
+        final=read_bytes,
+    )
+    actual_sha = digest.hexdigest()
+    if actual_sha.lower() != str(a["sha256"]).lower():
+        if dataset_dir.exists():
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+        raise RuntimeError(
+            f"SHA256 校验失败：{a['name']} 磁带读到 {actual_sha}，"
+            f"目录库记录 {a['sha256']}。本次解出的内容已删除。"
+        )
 
 
 # --- verify ------------------------------------------------------------------
@@ -1000,7 +1178,10 @@ def verify_archive(
     *,
     assume_mounted: bool = False,
 ) -> dict:
-    """Read one archive back from tape and check its SHA256.
+    """Stream one archive from tape and check its SHA256.
+
+    与恢复一样改为流式：不落本地盘，边读边算。目录库记录为空串的
+    sha256（从 manifest sidecar 重建目录库的行）在校验通过后回填。
 
     Args:
         assume_mounted: Skip the "insert tape" prompt because the caller
@@ -1013,20 +1194,35 @@ def verify_archive(
         raise KeyError(f"目录库中没有 archive {archive_name!r}")
 
     tape_label = row["tape_label"]
+    recorded = str(row["sha256"] or "")
     if not assume_mounted:
         tape.prompt_for_tape_insertion(tape_label)
-    with tempfile.TemporaryDirectory(prefix="cryoem_verify_") as tmp:
-        tmp_path = Path(tmp) / f"{archive_name}.tar.zst"
-        device.read_archive(
-            tmp_path,
-            expected_bytes=int(row["archive_size"]),
-            archive_name=f"{archive_name}.tar.zst",
-        )
-        actual = sha256_file(tmp_path)
 
-    if actual.lower() != row["sha256"].lower():
+    expected = int(row["archive_size"])
+    digest = hashlib.sha256()
+    read_bytes = 0
+    bar = ByteProgress(f"校验 {archive_name}", expected)
+    with device.open_archive(f"{archive_name}.tar.zst", expected_bytes=expected) as fh:
+        while True:
+            chunk = fh.read(STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            read_bytes += len(chunk)
+            bar.update(read_bytes)
+    bar.done(final=read_bytes)
+
+    actual = digest.hexdigest()
+    if not recorded:
+        # 重建目录库的行没有 sha256（manifest 里不含它）；首次校验通过即回填。
+        with catalog.transaction(conn):
+            catalog.update_archive_sha256(conn, archive_name, actual)
+        print(f"  OK  {archive_name}  SHA256 回填 {actual[:12]}...  来源：磁带 {tape_label}")
+        return {"name": archive_name, "ok": True, "source": f"磁带 {tape_label}"}
+
+    if actual.lower() != recorded.lower():
         raise RuntimeError(
-            f"SHA256 校验失败（磁带 {tape_label}）：{actual} != {row['sha256']}"
+            f"SHA256 校验失败（磁带 {tape_label}）：{actual} != {recorded}"
         )
     print(f"  OK  {archive_name}  SHA256 一致  来源：磁带 {tape_label}")
     return {"name": archive_name, "ok": True, "source": f"磁带 {tape_label}"}
@@ -1049,6 +1245,141 @@ def verify_tape(conn, device: tape.TapeDevice, label: str) -> tuple[int, int]:
             print(f"  FAIL  {a['name']}  {exc}")
             fail += 1
     return ok, fail
+
+
+# --- rebuild catalog from tape manifests -------------------------------------
+
+
+def rebuild_catalog_from_manifests(
+    conn,
+    device: tape.TapeDevice,
+    *,
+    capacity_bytes: int,
+) -> dict:
+    """从当前挂载磁带上的 manifest sidecar 重建目录库记录。
+
+    适用场景：``catalog.sqlite3`` 丢失或损坏。manifest 含 project/datasets/
+    file_list/tape_label/archive_size/timestamp -- 唯独没有 archive 的
+    sha256（写入时它要等压缩流结束才确定）。因此重建行的 sha256 为空串；
+    之后对该磁带跑一次「校验磁带」（菜单 4）会在校验通过后自动回填。
+
+    幂等：目录库中已存在的 tape/dataset/archive 记录不会被覆盖，可以逐盘
+    磁带重复执行本命令。file_number 按同一磁带上 archive 名字（即写入时间）
+    顺序推导 -- 只用于展示，LTFS 实际按文件名寻址。
+
+    Returns:
+        统计字典：``{"tapes", "datasets", "archives", "files",
+        "existing_archives"}``。
+    """
+    mount = Path(device.mount)
+    if not mount.is_dir():
+        raise RuntimeError(f"LTFS 挂载点不存在或不是目录：{mount}")
+    manifest_paths = sorted(mount.glob("*.manifest.json"))
+    if not manifest_paths:
+        raise RuntimeError(
+            f"挂载点 {mount} 下没有 manifest（*.manifest.json）。"
+            f"请挂载对应磁带后重试。"
+        )
+
+    parsed: list[tuple[str, dict]] = []
+    for mp in manifest_paths:
+        try:
+            data = json.loads(mp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"manifest 解析失败：{mp}: {exc}") from exc
+        parsed.append((mp.name[: -len(".manifest.json")], data))
+    parsed.sort(key=lambda item: item[0])
+
+    stats = {
+        "tapes": 0,
+        "datasets": 0,
+        "archives": 0,
+        "files": 0,
+        "existing_archives": 0,
+    }
+    tape_counter: dict[str, int] = {}
+    with catalog.transaction(conn):
+        for archive_name, data in parsed:
+            tape_label = str(data.get("tape_label") or "")
+            if not tape_label:
+                raise RuntimeError(
+                    f"{archive_name}.manifest.json 缺少 tape_label，无法归入磁带。"
+                )
+            if catalog.get_tape(conn, tape_label) is None:
+                catalog.ensure_tape(conn, tape_label, capacity_bytes)
+                stats["tapes"] += 1
+            if catalog.get_archive(conn, archive_name) is not None:
+                stats["existing_archives"] += 1
+                continue
+
+            n = tape_counter.get(tape_label)
+            if n is None:
+                n = catalog.next_file_number(conn, tape_label)
+            file_number = n
+            tape_counter[tape_label] = n + 1
+
+            # datasets（manifest 里的 id 是旧库的主键，只作参考，不作映射）
+            ds_ids: dict[str, int] = {}
+            for ds in data.get("datasets") or []:
+                name = str(ds.get("name") or "")
+                if not name:
+                    continue
+                if catalog.get_dataset(conn, name) is None:
+                    stats["datasets"] += 1
+                ds_ids[name] = catalog.ensure_dataset(
+                    conn,
+                    name,
+                    project=ds.get("project"),
+                    operator=ds.get("operator"),
+                    comment=ds.get("comment"),
+                )
+
+            file_rows: list[tuple[str, int, str, int, str]] = []
+            uncompressed = 0
+            for entry in data.get("file_list") or []:
+                ds_name = str(entry.get("dataset") or "")
+                path = str(entry.get("path") or "")
+                prefix = f"{ds_name}/"
+                if ds_name not in ds_ids:
+                    # file_list 引用了 datasets 列表之外的 dataset（理论
+                    # 上不该发生）：兜底建行，保证文件记录不丢。
+                    if catalog.get_dataset(conn, ds_name) is None:
+                        stats["datasets"] += 1
+                    ds_ids[ds_name] = catalog.ensure_dataset(conn, ds_name)
+                if not path.startswith(prefix):
+                    raise RuntimeError(
+                        f"{archive_name}.manifest.json 的文件条目 {path!r} "
+                        f"没有 dataset 前缀 {prefix!r}，无法还原相对路径。"
+                    )
+                rel = path[len(prefix):]
+                size = int(entry.get("size") or 0)
+                uncompressed += size
+                file_rows.append(
+                    (archive_name, ds_ids[ds_name], rel, size, str(entry.get("mtime") or ""))
+                )
+
+            # manifest 里没有 sha256：置空，校验磁带时回填。
+            catalog.insert_archive(
+                conn,
+                name=archive_name,
+                archive_size=int(data.get("archive_size") or 0),
+                uncompressed_size=uncompressed,
+                sha256="",
+                tape_label=tape_label,
+                file_number=file_number,
+                create_time=str(data.get("timestamp") or "") or now_iso(),
+            )
+            for ds_id in ds_ids.values():
+                catalog.add_dataset_archive(
+                    conn, ds_id, archive_name,
+                    catalog.next_dataset_archive_sequence(conn, ds_id),
+                )
+            catalog.insert_files_batch(conn, file_rows)
+            catalog.increment_tape_archive_count(conn, tape_label)
+            stats["archives"] += 1
+            stats["files"] += len(file_rows)
+
+    return stats
 
 
 # --- search ------------------------------------------------------------------
