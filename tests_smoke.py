@@ -83,16 +83,16 @@ def test_packing_split() -> None:
         sb = archive.DatasetSpec(source=b, name="B", files=archive.walk_dataset(b))
 
         names = [f"20260728_{i:04d}" for i in range(1, 10)]
-        archives = archive.pack_datasets([(1, sa), (2, sb)], names, target_bytes=3500)
+        archives = archive.pack_datasets([("A", sa), ("B", sb)], names, target_bytes=3500)
         assert len(archives) == 2, f"expected 2 archives, got {len(archives)}"
         # First archive: A only (3000 B)
         assert archives[0].estimated_size == 3000
-        assert all(f[1] == "A" for f in archives[0].files)
+        assert all(f[0] == "A" for f in archives[0].files)
         # Second archive: A leftover (0) + B (500) = wait, target 3500
         # After first archive (3000 B), next file is a3 (3000 B) which would
         # push to 6000, so it opens new archive. So second archive is a3 + b1.
         assert archives[1].estimated_size == 3500
-        ds_in_second = sorted(set(f[1] for f in archives[1].files))
+        ds_in_second = sorted(set(f[0] for f in archives[1].files))
         assert ds_in_second == ["A", "B"], f"got {ds_in_second}"
         print("  OK  packing split (dataset split + leftover fill)")
     finally:
@@ -113,10 +113,10 @@ def test_packing_all_in_one() -> None:
         sa = archive.DatasetSpec(source=a, name="A", files=archive.walk_dataset(a))
         sb = archive.DatasetSpec(source=b, name="B", files=archive.walk_dataset(b))
         archives = archive.pack_datasets(
-            [(1, sa), (2, sb)], ["20260728_0001"], target_bytes=1_000_000
+            [("A", sa), ("B", sb)], ["20260728_0001"], target_bytes=1_000_000
         )
         assert len(archives) == 1
-        assert sorted(set(f[1] for f in archives[0].files)) == ["A", "B"]
+        assert sorted(set(f[0] for f in archives[0].files)) == ["A", "B"]
         print("  OK  packing all-in-one (multiple small datasets in one archive)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -131,7 +131,7 @@ def test_packing_oversized_file() -> None:
 
         sa = archive.DatasetSpec(source=a, name="A", files=archive.walk_dataset(a))
         try:
-            archive.pack_datasets([(1, sa)], ["20260728_0001"], target_bytes=1000)
+            archive.pack_datasets([("A", sa)], ["20260728_0001"], target_bytes=1000)
         except RuntimeError as e:
             assert "文件过大" in str(e) or "too large" in str(e).lower()
             print("  OK  oversized file rejected")
@@ -313,7 +313,7 @@ def test_archive_contains_real_data() -> None:
         (src / "sub" / "gain.mrc").write_bytes(payload)
 
         spec_ds = archive.DatasetSpec(source=src, name="DS", files=archive.walk_dataset(src))
-        archives = archive.pack_datasets([(1, spec_ds)], ["20260728_0001"])
+        archives = archive.pack_datasets([("DS", spec_ds)], ["20260728_0001"])
         assert len(archives) == 1
 
         mount = tmp / "ltfs"
@@ -550,10 +550,10 @@ def test_manifest_sidecar_written() -> None:
         )
         spec = archive.ArchiveSpec(
             name="20260729_0001",
-            files=[(1, "DS", src / "movie.mrc", "movie.mrc", 65536, "t")],
+            files=[("DS", src / "movie.mrc", "movie.mrc", 65536, "t")],
             estimated_size=65536,
         )
-        dataset_lookup = {1: ds_spec}
+        dataset_lookup = {"DS": ds_spec}
 
         mount = tmp / "ltfs"
         mount.mkdir()
@@ -989,12 +989,12 @@ def test_restore_streaming_and_filtered() -> None:
         spec_a = archive.DatasetSpec(source=src_a, name="dsA", files=archive.walk_dataset(src_a))
         spec_b = archive.DatasetSpec(source=src_b, name="dsB", files=archive.walk_dataset(src_b))
         files = []
-        for ds_id, sp in ((1, spec_a), (2, spec_b)):
+        for sp in (spec_a, spec_b):
             for p, s, m in sp.files:
-                files.append((ds_id, sp.name, p, p.relative_to(sp.source).as_posix(), s, m))
+                files.append((sp.name, p, p.relative_to(sp.source).as_posix(), s, m))
         spec = archive.ArchiveSpec(
             name="20260729_0001", files=files,
-            estimated_size=sum(f[4] for f in files),
+            estimated_size=sum(f[3] for f in files),
         )
 
         mount = tmp / "ltfs"
@@ -1017,7 +1017,11 @@ def test_restore_streaming_and_filtered() -> None:
             catalog.add_dataset_archive(conn, ds_a, "20260729_0001", 1)
             catalog.add_dataset_archive(conn, ds_b, "20260729_0001", 1)
             catalog.insert_files_batch(
-                conn, [("20260729_0001", d, r, s, m) for d, r, s, m in file_rows],
+                conn,
+                [
+                    ("20260729_0001", {"dsA": ds_a, "dsB": ds_b}[d], r, s, m)
+                    for d, r, s, m in file_rows
+                ],
             )
 
         archive.confirm = lambda *a, **kw: True
@@ -1053,6 +1057,153 @@ def test_restore_streaming_and_filtered() -> None:
 
 
 
+def test_failed_backup_leaves_no_ledger() -> None:
+    """备份失败或取消不得在台账里留下空 dataset/tape 条目。
+
+    台账行（dataset / tape / archive / file）只允许在 archive 成功落盘并
+    提交事务后出现（create_archives 5h）。
+    """
+    class FailingDevice:
+        """free_bytes 正常返回，写盘必炸。"""
+
+        def free_bytes(self):
+            return 100 * GB
+
+        def archive_writer(self, *args, **kwargs):
+            raise RuntimeError("drive exploded")
+
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_fail_"))
+    original_confirm = archive.confirm
+    try:
+        src = tmp / "ds"
+        src.mkdir()
+        (src / "a.mrc").write_bytes(b"x" * 100)
+        ds_spec = archive.DatasetSpec(source=src, name="DS", files=archive.walk_dataset(src))
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+
+        # 写盘失败：异常向上传播，台账里不留任何条目
+        archive.confirm = lambda *a, **kw: True
+        try:
+            archive.create_archives(
+                conn, FailingDevice(), [ds_spec], "T1", archive.LTO6_RAW_BYTES
+            )
+        except RuntimeError:
+            pass  # zstd 缺失或写盘失败，均属预期失败路径
+        else:
+            raise AssertionError("expected the failing write to propagate")
+        assert catalog.list_datasets(conn) == [], "失败备份不应留下 dataset 条目"
+        assert catalog.list_tapes(conn) == [], "失败备份不应留下 tape 条目"
+        assert catalog.list_archives(conn) == []
+
+        # 用户在「确认开始写入」处取消：同样不留任何条目
+        archive.confirm = lambda *a, **kw: False
+        try:
+            archive.create_archives(
+                conn, FailingDevice(), [ds_spec], "T2", archive.LTO6_RAW_BYTES
+            )
+        except RuntimeError:
+            pass  # 「已取消。」
+        else:
+            raise AssertionError("expected cancellation")
+        assert catalog.list_datasets(conn) == []
+        assert catalog.list_tapes(conn) == []
+        conn.close()
+        print("  OK  备份失败/取消不产生台账条目（成功提交后才记录）")
+    finally:
+        archive.confirm = original_confirm
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_delete_catalog_entries() -> None:
+    """catalog.delete_dataset / delete_archive / delete_tape：级联、计数、拒绝条件。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cryoem_del_"))
+    try:
+        conn = catalog.open_db(str(tmp / "test.sqlite3"))
+        catalog.ensure_tape(conn, "T1", archive.LTO6_RAW_BYTES)
+        ds_a = catalog.ensure_dataset(conn, "dsA")
+        ds_b = catalog.ensure_dataset(conn, "dsB")
+        with catalog.transaction(conn):
+            catalog.insert_archive(
+                conn, name="20260823_0001", archive_size=10, uncompressed_size=20,
+                sha256="a" * 64, tape_label="T1", file_number=1,
+            )
+            catalog.add_dataset_archive(conn, ds_a, "20260823_0001", 1)
+            catalog.add_dataset_archive(conn, ds_b, "20260823_0001", 2)
+            catalog.insert_files_batch(
+                conn,
+                [
+                    ("20260823_0001", ds_a, "a.mrc", 10, "t"),
+                    ("20260823_0001", ds_b, "b.mrc", 10, "t"),
+                ],
+            )
+
+        # 删除 archive：级联清掉两个 dataset 的关联与文件记录，磁带计数减一
+        stats = catalog.delete_archive(conn, "20260823_0001")
+        assert stats["datasets"] == 2 and stats["files"] == 2
+        assert stats["tape_label"] == "T1"
+        assert catalog.get_archive(conn, "20260823_0001") is None
+        assert catalog.get_tape(conn, "T1")["archive_count"] == 0
+        # dataset 行仍在，但已无任何关联
+        assert catalog.dataset_usage(conn, ds_a) == (0, 0)
+        assert catalog.dataset_usage(conn, ds_b) == (0, 0)
+
+        # archive_count=0 后磁带条目可删除
+        catalog.delete_tape(conn, "T1")
+        assert catalog.get_tape(conn, "T1") is None
+
+        # 磁带上仍有 archive 记录时 delete_tape 拒绝
+        catalog.ensure_tape(conn, "T2", archive.LTO6_RAW_BYTES)
+        with catalog.transaction(conn):
+            catalog.insert_archive(
+                conn, name="20260823_0002", archive_size=10, uncompressed_size=20,
+                sha256="b" * 64, tape_label="T2", file_number=1,
+            )
+        try:
+            catalog.delete_tape(conn, "T2")
+        except RuntimeError as exc:
+            assert "archive 记录" in str(exc)
+        else:
+            raise AssertionError("expected delete_tape to refuse a non-empty tape")
+
+        # 删除 dataset：级联删掉该 dataset 自己的关联/文件，共享 archive
+        # 里的其它 dataset 记录不受影响
+        ds_c = catalog.ensure_dataset(conn, "dsC")
+        with catalog.transaction(conn):
+            catalog.add_dataset_archive(conn, ds_b, "20260823_0002", 1)
+            catalog.add_dataset_archive(conn, ds_c, "20260823_0002", 2)
+            catalog.insert_files_batch(
+                conn,
+                [
+                    ("20260823_0002", ds_b, "b.mrc", 10, "t"),
+                    ("20260823_0002", ds_c, "c.mrc", 10, "t"),
+                ],
+            )
+        stats = catalog.delete_dataset(conn, "dsB")
+        # dsB 在 20260823_0001 被删时已失去那条关联，此处只剩 20260823_0002
+        assert stats["archives"] == 1 and stats["files"] == 1
+        assert catalog.get_dataset(conn, "dsB") is None
+        # dsC 的记录完好；archive 仍在
+        assert catalog.dataset_usage(conn, ds_c) == (1, 1)
+        assert catalog.get_archive(conn, "20260823_0002") is not None
+
+        # 删除不存在的条目应报 KeyError
+        for fn in (
+            lambda: catalog.delete_dataset(conn, "nope"),
+            lambda: catalog.delete_archive(conn, "nope"),
+            lambda: catalog.delete_tape(conn, "nope"),
+        ):
+            try:
+                fn()
+            except KeyError:
+                pass
+            else:
+                raise AssertionError("expected KeyError for missing entry")
+        conn.close()
+        print("  OK  删除台账条目（级联 / 计数 / 拒绝条件 / 共享 archive 隔离）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     print("CryoEM archive smoke tests")
     print("=" * 60)
@@ -1082,6 +1233,8 @@ def main() -> int:
     test_export_to_csv()
     test_dynamic_create_archives_loop()
     test_restore_streaming_and_filtered()
+    test_failed_backup_leaves_no_ledger()
+    test_delete_catalog_entries()
     print("=" * 60)
     print("all smoke tests passed")
     return 0

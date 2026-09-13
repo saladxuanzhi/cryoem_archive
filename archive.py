@@ -204,7 +204,7 @@ class ArchiveManifest:
 
 def build_archive_manifest(
     spec: "ArchiveSpec",
-    dataset_lookup: dict[int, "DatasetSpec"],
+    dataset_lookup: dict[str, "DatasetSpec"],
     *,
     tape_label: str,
     archive_size: int = 0,
@@ -213,24 +213,25 @@ def build_archive_manifest(
 
     Args:
         spec: 即将写入的 archive 计划（包含所有文件）。
-        dataset_lookup: ``dataset_id -> DatasetSpec`` 映射，用于回查
-            project / operator / comment 等元数据。
+        dataset_lookup: ``dataset_name -> DatasetSpec`` 映射，用于回查
+            project / operator / comment 等元数据。用名字做 key 而不是
+            dataset_id：台账行要到 archive 提交时才入库，写入阶段还没有
+            真实 id（见 :func:`create_archives`）。
         tape_label: 目标磁带卷名（写入时确定，所以早于体积回填也是合法的）。
         archive_size: 写入后的实际体积（bytes），写入前可传 0。
     """
-    seen: set[int] = set()
+    seen: set[str] = set()
     datasets: list[dict] = []
     for entry in spec.files:
-        ds_id = entry[0]
-        if ds_id in seen:
+        ds_name = entry[0]
+        if ds_name in seen:
             continue
-        seen.add(ds_id)
-        meta = dataset_lookup.get(ds_id)
+        seen.add(ds_name)
+        meta = dataset_lookup.get(ds_name)
         if meta is None:
             continue
         datasets.append(
             {
-                "id": int(ds_id),
                 "name": meta.name,
                 "project": meta.project or "",
                 "operator": meta.operator or "",
@@ -239,7 +240,7 @@ def build_archive_manifest(
         )
 
     file_list: list[dict] = []
-    for ds_id, ds_name, _abs, rel, size, mtime in spec.files:
+    for ds_name, _abs, rel, size, mtime in spec.files:
         file_list.append(
             {
                 "dataset": ds_name,
@@ -279,8 +280,10 @@ class ArchiveSpec:
     that will be packed into it."""
 
     name: str
-    # (dataset_id, dataset_name, abs_path, rel_path_within_dataset, size, mtime)
-    files: list[tuple[int, str, Path, str, int, str]] = field(default_factory=list)
+    # (dataset_name, abs_path, rel_path_within_dataset, size, mtime)
+    # 用 dataset 名而不是 dataset_id 做 key：台账行推迟到 archive 提交时
+    # 才入库，写入阶段还没有真实 id。
+    files: list[tuple[str, Path, str, int, str]] = field(default_factory=list)
     estimated_size: int = 0  # uncompressed bytes
 
 
@@ -362,7 +365,7 @@ def walk_dataset(source: Path, *, interactive: bool = True) -> list[tuple[Path, 
 
 
 def pack_datasets(
-    datasets: list[tuple[int, DatasetSpec]],
+    datasets: list[tuple[str, DatasetSpec]],
     archive_names: list[str],
     *,
     target_bytes: int = TARGET_ARCHIVE_BYTES,
@@ -374,7 +377,7 @@ def pack_datasets(
     TargetSize」实时循环，并不再使用本函数。
 
     Args:
-        datasets: ``[(dataset_id, spec), ...]`` in user order.
+        datasets: ``[(dataset_name, spec), ...]`` in user order.
         archive_names: Pre-allocated YYYYMMDD_NNNN names (one per archive).
         target_bytes: Per-archive size target. The packing closes an
             archive when the next file would push it over this size.
@@ -387,7 +390,7 @@ def pack_datasets(
         RuntimeError: If a single file is larger than ``target_bytes``.
     """
     archives: list[ArchiveSpec] = []
-    current_files: list[tuple[int, str, Path, str, int, str]] = []
+    current_files: list[tuple[str, Path, str, int, str]] = []
     current_size = 0
     name_idx = 0
 
@@ -408,7 +411,7 @@ def pack_datasets(
         current_files = []
         current_size = 0
 
-    for dataset_id, spec in datasets:
+    for ds_name, spec in datasets:
         for abs_path, size, mtime in spec.files:
             if size > target_bytes:
                 raise RuntimeError(
@@ -418,7 +421,7 @@ def pack_datasets(
             if current_size + size > target_bytes and current_files:
                 flush()
             rel = abs_path.relative_to(spec.source).as_posix()
-            current_files.append((dataset_id, spec.name, abs_path, rel, size, mtime))
+            current_files.append((ds_name, abs_path, rel, size, mtime))
             current_size += size
 
     flush()
@@ -446,8 +449,8 @@ class _TarFeeder:
         self.spec = spec
         self.sink = sink
         self.error: BaseException | None = None
-        # (dataset_id, rel_path, size, mtime) for files actually archived.
-        self.file_rows: list[tuple[int, str, int, str]] = []
+        # (dataset_name, rel_path, size, mtime) for files actually archived.
+        self.file_rows: list[tuple[str, str, int, str]] = []
         self.uncompressed_size = 0
 
     def run(self) -> None:
@@ -462,13 +465,13 @@ class _TarFeeder:
                 bufsize=TAR_BLOCK_BYTES,
                 copybufsize=STREAM_CHUNK_BYTES,
             ) as tf:
-                for ds_id, ds_name, abs_path, rel_path, size, mtime in self.spec.files:
+                for ds_name, abs_path, rel_path, size, mtime in self.spec.files:
                     tf.add(
                         str(abs_path),
                         arcname=f"{ds_name}/{rel_path}",
                         recursive=False,
                     )
-                    self.file_rows.append((ds_id, rel_path, size, mtime))
+                    self.file_rows.append((ds_name, rel_path, size, mtime))
                     self.uncompressed_size += size
         except BaseException as exc:  # noqa: BLE001 — re-raised on the main thread
             self.error = exc
@@ -484,12 +487,12 @@ def build_and_write_archive(
     device: tape.TapeDevice,
     tape_label: str,
     *,
-    dataset_lookup: dict[int, "DatasetSpec"] | None = None,
+    dataset_lookup: dict[str, "DatasetSpec"] | None = None,
 ) -> tuple[int, int, str, list[tuple[int, str, int, str]], "Path | None"]:
     """Stream ``spec`` onto the tape as ``<spec.name>.tar.zst``，并写出 sidecar manifest。
 
     Returns ``(compressed_size, uncompressed_size, sha256, file_rows, manifest_path)``
-    其中 ``file_rows`` 是 ``(dataset_id, rel_path, size, mtime)`` 待入库的列表；
+    其中 ``file_rows`` 是 ``(dataset_name, rel_path, size, mtime)`` 待入库的列表；
     ``manifest_path`` 是 sidecar manifest 文件的路径，若 ``dataset_lookup``
     未提供则为 ``None``。
 
@@ -668,9 +671,14 @@ def create_archives(
 
     沿用职责：
 
-    * dataset 行入库与续传（续传以 catalog 为准）；
+    * 续传（以 catalog 为准）；
     * 单个 archive 失败或 catalog 失败时回收 orphan 文件；
     * 任何 archive 都不能跨磁带。
+
+    台账写入时机：**archive 成功落盘并提交事务后**才记录 dataset / tape /
+    archive / file 行（见 5h）。在此之前台账里不会有本次备份的任何痕迹，
+    所以备份失败、中途取消（Ctrl+C）都不会留下空条目。流水线内部用
+    dataset 名做 key，提交时才分配真实 dataset id。
 
     Args:
         backup_dir: 每成功入库一个 archive 后，把目录库快照到该目录
@@ -687,27 +695,22 @@ def create_archives(
         total = sum(f[1] for f in spec.files)
         print(f"        {len(spec.files)} 个文件，{format_bytes(total)}")
 
-    # 2) Insert dataset rows + keep id->spec 映射（manifest 需要回查元数据）。
-    dataset_ids: list[tuple[int, DatasetSpec]] = []
-    dataset_lookup: dict[int, DatasetSpec] = {}
-    for spec in datasets:
-        ds_id = catalog.ensure_dataset(
-            conn,
-            spec.name,
-            project=spec.project,
-            operator=spec.operator,
-            comment=spec.comment,
-        )
-        dataset_ids.append((ds_id, spec))
-        dataset_lookup[ds_id] = spec
+    # 2) name -> spec 映射（manifest 回查元数据用）。注意：这里**不**提前
+    #    插入 dataset 行——见函数 docstring 的「台账写入时机」。
+    dataset_lookup: dict[str, DatasetSpec] = {spec.name: spec for spec in datasets}
 
     # 2b) Resume: drop files an earlier run already committed to tape.
     #     比对 (size, mtime) 而不是只看路径：归档后被修改过的文件（同名
     #     同路径、内容已变）必须重新归档，否则会被路径去重永久跳过。
     resumed = 0
     rearchive_total = 0
-    for ds_id, spec in dataset_ids:
-        archived = catalog.get_archived_file_meta(conn, ds_id)
+    for spec in datasets:
+        ds_row = catalog.get_dataset(conn, spec.name)
+        archived = (
+            catalog.get_archived_file_meta(conn, int(ds_row["id"]))
+            if ds_row is not None
+            else {}
+        )
         if not archived:
             continue
         kept = []
@@ -743,7 +746,7 @@ def create_archives(
             )
         spec.files = kept
 
-    if all(not spec.files for _, spec in dataset_ids):
+    if all(not spec.files for spec in datasets):
         if resumed:
             print()
             print("  ✓ 所有文件均已归档完成，无需继续。")
@@ -751,14 +754,14 @@ def create_archives(
         raise RuntimeError("所有 Dataset 均为空，没有可归档内容。")
 
     # 3) 把所有待写入的文件摊平成一个 list（保持 dataset 内部顺序）。
-    #    条目 = (ds_id, ds_name, abs_path, rel_path, size, mtime)
-    remaining: list[tuple[int, str, Path, str, int, str]] = []
-    for ds_id, spec in dataset_ids:
+    #    条目 = (ds_name, abs_path, rel_path, size, mtime)
+    remaining: list[tuple[str, Path, str, int, str]] = []
+    for spec in datasets:
         for abs_path, size, mtime in spec.files:
             rel = abs_path.relative_to(spec.source).as_posix()
-            remaining.append((ds_id, spec.name, abs_path, rel, size, mtime))
+            remaining.append((spec.name, abs_path, rel, size, mtime))
 
-    total_bytes = sum(f[4] for f in remaining)
+    total_bytes = sum(f[3] for f in remaining)
     print()
     print(f"  源数据总量 {format_bytes(total_bytes)}（{len(remaining)} 个文件）。")
     free_now = device.free_bytes()
@@ -768,8 +771,8 @@ def create_archives(
     if not confirm("确认开始写入？（动态切分，首包前会再次确认）", default=False):
         raise RuntimeError("已取消。")
 
-    # 4) Make sure the destination tape exists.
-    catalog.ensure_tape(conn, tape_label, capacity_bytes, status="in_use")
+    # 4) 目标磁带行同样推迟到首个 archive 提交时创建（5h），取消/失败不留
+    #    空磁带条目。
     current_tape = tape_label
     written: list[dict] = []
     today = datetime.now(tz=timezone.utc).strftime("%Y%m%d")
@@ -787,7 +790,7 @@ def create_archives(
 
         # 5a) 取当前磁带剩余空间
         free = device.free_bytes()
-        total_remaining_bytes = sum(f[4] for f in remaining)
+        total_remaining_bytes = sum(f[3] for f in remaining)
 
         # 5b) 计算本轮 TargetSize。
         # 唯一的换磁带触发条件是剩余空间不够切出下一个 50GB 安全包；
@@ -810,19 +813,20 @@ def create_archives(
             reason = "剩余空间不足触发动态换磁带。"
             print()
             print(f"  ↻ {reason}")
-            catalog.set_tape_status(conn, current_tape, "full")
+            # 磁带确实满了，这属于真实状态：即使本盘一个 archive 都没提交
+            # 过（行还不存在），也补建一条标 full 的记录。
+            catalog.ensure_tape(conn, current_tape, capacity_bytes, status="full")
             current_tape = tape.prompt_for_full_tape_swap(
                 f"磁带 {current_tape} {reason}",
             )
-            catalog.ensure_tape(conn, current_tape, capacity_bytes, status="in_use")
-            continue  # 新磁带，继续外层循环
+            continue  # 新磁带，继续外层循环（5h 提交时才 ensure_tape）
 
         # 5e) 贪心切出 1 个 ArchiveSpec（不超过 target_bytes）。
         chunk_files, chunk_size = _take_one_archive(remaining, target_bytes)
         if not chunk_files:
             # 防御性兜底：remaining 非空但切不动（全部文件都 > target）。
             # 给用户一个明确报错，包含那个超大文件的路径。
-            big = max(remaining, key=lambda f: f[4])
+            big = max(remaining, key=lambda f: f[3])
             raise RuntimeError(
                 f"无法切分：仍有 {len(remaining)} 个文件，但最大的 "
                 f"{big[2]} ({format_bytes(big[4])}) 大于当前 TargetSize "
@@ -870,7 +874,7 @@ def create_archives(
             print()
             print(f"  ✗ {exc}")
             print(f"     不完整的 {spec.name}.tar.zst 已删除，目录库未记录。")
-            catalog.set_tape_status(conn, current_tape, "full")
+            catalog.ensure_tape(conn, current_tape, capacity_bytes, status="full")
             if not confirm("是否更换磁带并继续？", default=True):
                 raise RuntimeError(
                     f"已中止。{spec.name} 及其后续内容未归档；"
@@ -879,16 +883,20 @@ def create_archives(
             current_tape = tape.prompt_for_full_tape_swap(
                 f"磁带 {current_tape} 空间不足。"
             )
-            catalog.ensure_tape(conn, current_tape, capacity_bytes, status="in_use")
             continue  # 重新读取剩余空间、写同一逻辑
 
         print(f"  ✓ SHA256 {spec.name}  {sha[:12]}...")
         if manifest_path is not None:
             print(f"  ✓ manifest  → {manifest_path.name}")
 
-        # 5h) 在一个事务里写 catalog + 增计数器；失败时移除 orphan 文件。
+        # 5h) 第一个台账写入点：archive 已成功落盘，这里在一个事务里补建
+        #     tape / dataset 行（首次提交时它们还不存在）并写入 archive、
+        #     关联与文件记录；失败时移除 orphan 文件。
         try:
             with catalog.transaction(conn):
+                catalog.ensure_tape(
+                    conn, current_tape, capacity_bytes, status="in_use"
+                )
                 catalog.insert_archive(
                     conn,
                     name=spec.name,
@@ -898,7 +906,17 @@ def create_archives(
                     tape_label=current_tape,
                     file_number=file_number,
                 )
-                for ds_id in sorted({ds_id for ds_id, *_ in file_rows}):
+                ds_ids: dict[str, int] = {}
+                for ds_name in sorted({row[0] for row in file_rows}):
+                    meta = dataset_lookup[ds_name]
+                    ds_id = catalog.ensure_dataset(
+                        conn,
+                        ds_name,
+                        project=meta.project,
+                        operator=meta.operator,
+                        comment=meta.comment,
+                    )
+                    ds_ids[ds_name] = ds_id
                     catalog.add_dataset_archive(
                         conn,
                         ds_id,
@@ -908,8 +926,8 @@ def create_archives(
                 catalog.insert_files_batch(
                     conn,
                     [
-                        (spec.name, ds_id, rel_path, size, mtime)
-                        for ds_id, rel_path, size, mtime in file_rows
+                        (spec.name, ds_ids[ds_name], rel_path, size, mtime)
+                        for ds_name, rel_path, size, mtime in file_rows
                     ],
                 )
                 catalog.increment_tape_archive_count(conn, current_tape)
@@ -949,9 +967,9 @@ def create_archives(
 
 
 def _take_one_archive(
-    remaining: list[tuple[int, str, Path, str, int, str]],
+    remaining: list[tuple[str, Path, str, int, str]],
     target_bytes: int,
-) -> tuple[list[tuple[int, str, Path, str, int, str]], int]:
+) -> tuple[list[tuple[str, Path, str, int, str]], int]:
     """从 ``remaining`` 头部贪心切出最多 ``target_bytes`` 的一个 archive。
 
     修改入参 ``remaining``（pop 出已写入的文件）。返回 ``(chunk_files, chunk_size)``。
@@ -962,11 +980,11 @@ def _take_one_archive(
     * 单文件 > target 时允许「仅这一个文件」单独作为一个 chunk（前提条件是
       它已经能够放进当前剩余空间，否则由外层动态循环触发换磁带）。
     """
-    chunk: list[tuple[int, str, Path, str, int, str]] = []
+    chunk: list[tuple[str, Path, str, int, str]] = []
     chunk_size = 0
     while remaining:
         head = remaining[0]
-        size = head[4]
+        size = head[3]
         # 第一个文件就可以是「比 target 还大的单文件」：允许放行（外层会
         # 凭借总剩余空间决定是否换磁带）。
         if chunk and chunk_size + size > target_bytes:

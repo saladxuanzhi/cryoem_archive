@@ -75,6 +75,7 @@ MENU = """
   5 查看台账
   6 导出台账 (CSV)
   7 重建目录库（从磁带 manifest）
+  8 删除台账条目
   0 退出
 ========================================
 """
@@ -212,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
                     do_export_csv(conn, logger)
                 elif choice == "7":
                     do_rebuild_catalog(conn, device, logger)
+                elif choice == "8":
+                    do_delete_entry(conn, logger)
                 elif choice == "0":
                     print("再见。")
                     return 0
@@ -586,6 +589,136 @@ def do_rebuild_catalog(
         print("  提示：重建的 archive 尚无 SHA256 记录，请对该磁带执行")
         print("        「4 校验磁带」完成校验并自动回填。")
     press_enter()
+
+
+# ============================================================================
+# 菜单项 8：删除台账条目
+# ============================================================================
+
+
+def do_delete_entry(conn, logger: logging.Logger) -> None:
+    """Menu item 8: delete a specific catalog entry (dataset / archive / tape).
+
+    只动目录库，磁带上的数据是只读的、不会被触碰。删除动作不可逆，所以
+    每次删除前先把目录库快照一份（:data:`BACKUP_DIR`），删错还能找回。
+    """
+    print("[8] 删除台账条目")
+    print("-" * 60)
+    print("  1 删除 Dataset 条目")
+    print("  2 删除 Archive 条目")
+    print("  3 删除 Tape 条目（仅限其上没有 archive 记录时）")
+    sub = prompt("请选择")
+    print()
+    try:
+        if sub == "1":
+            _delete_dataset_flow(conn, logger)
+        elif sub == "2":
+            _delete_archive_flow(conn, logger)
+        elif sub == "3":
+            _delete_tape_flow(conn, logger)
+        else:
+            print("  无效选择。")
+            return
+    except KeyError as exc:
+        print(f"  {exc.args[0]}")
+        return
+    except Exception:
+        logger.exception("delete catalog entry failed")
+        raise
+    press_enter()
+
+
+def _snapshot_before_delete(conn, logger: logging.Logger) -> None:
+    """破坏性操作前快照目录库，删错还能从备份找回。"""
+    path = catalog.backup_db(conn, BACKUP_DIR)
+    if path is not None:
+        logger.info("pre-delete catalog backup -> %s", path)
+        print(f"  已快照目录库 → {path.name}")
+    else:
+        print("  ⚠ 目录库快照失败；建议先手动拷贝 data/catalog.sqlite3 再删除。")
+
+
+def _delete_dataset_flow(conn, logger: logging.Logger) -> None:
+    name = prompt("Dataset 名称")
+    if not name:
+        return
+    row = catalog.get_dataset(conn, name)
+    if row is None:
+        print(f"  未找到 Dataset {name!r}")
+        return
+    n_archives, n_files = catalog.dataset_usage(conn, int(row["id"]))
+    print(f"  Dataset {name}：关联 {n_archives} 个 archive、{n_files} 条文件记录。")
+    print("  ⚠ 只删除目录库记录，磁带上的数据不会被删除。")
+    if n_archives:
+        print(
+            "  ⚠ 删除后该 Dataset 无法再按名恢复/续传；"
+            "对同一来源重新备份会在磁带上产生重复数据。"
+        )
+    if not confirm("确认删除？", default=False):
+        print("  已取消。")
+        return
+    _snapshot_before_delete(conn, logger)
+    stats = catalog.delete_dataset(conn, name)
+    print(
+        f"  ✓ 已删除 Dataset {stats['name']}"
+        f"（含 {stats['archives']} 条 archive 关联、{stats['files']} 条文件记录）。"
+    )
+
+
+def _delete_archive_flow(conn, logger: logging.Logger) -> None:
+    name = prompt("Archive 名称（如 20260823_0001）")
+    if not name:
+        return
+    row = catalog.get_archive(conn, name)
+    if row is None:
+        print(f"  未找到 Archive {name!r}")
+        return
+    n_datasets, n_files = catalog.archive_usage(conn, name)
+    print(
+        f"  Archive {name}（磁带 {row['tape_label']}，file#{row['file_number']}）："
+        f"含 {n_datasets} 个 Dataset、{n_files} 条文件记录。"
+    )
+    if n_datasets > 1:
+        print(
+            "  ⚠ 该 archive 混装了多个 Dataset，删除会同时抹掉其它 Dataset "
+            "在本包内的记录。"
+        )
+    print("  ⚠ 只删除目录库记录；磁带上的 .tar.zst 与 manifest 不会被删除。")
+    if not confirm("确认删除？", default=False):
+        print("  已取消。")
+        return
+    _snapshot_before_delete(conn, logger)
+    stats = catalog.delete_archive(conn, name)
+    print(
+        f"  ✓ 已删除 Archive {stats['name']}"
+        f"（{stats['datasets']} 个 Dataset、{stats['files']} 条文件记录）；"
+        f"磁带 {stats['tape_label']} 的 archive 计数已同步减一。"
+    )
+
+
+def _delete_tape_flow(conn, logger: logging.Logger) -> None:
+    label = prompt("磁带标签")
+    if not label:
+        return
+    row = catalog.get_tape(conn, label)
+    if row is None:
+        print(f"  未找到磁带 {label!r}")
+        return
+    n_archives = len(catalog.list_archives(conn, tape_label=label))
+    if n_archives:
+        print(
+            f"  磁带 {label} 上仍有 {n_archives} 个 archive 记录，不能删除；"
+            "请先在「2 删除 Archive 条目」中逐一删除。"
+        )
+        return
+    print(f"  {catalog.format_tape_row(row).strip()}")
+    print("  ⚠ 只删除目录库记录，磁带本身及其上的文件不会被触碰。")
+    if not confirm("确认删除？", default=False):
+        print("  已取消。")
+        return
+    _snapshot_before_delete(conn, logger)
+    catalog.delete_tape(conn, label)
+    print(f"  ✓ 已删除磁带条目 {label}。")
 
 
 # ============================================================================

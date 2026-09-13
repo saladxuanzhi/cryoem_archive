@@ -602,6 +602,116 @@ def search_files(
     return list(conn.execute(sql, args))
 
 
+# --- catalog maintenance（删除条目）-------------------------------------------
+
+
+def dataset_usage(conn: sqlite3.Connection, dataset_id: int) -> tuple[int, int]:
+    """返回 ``(archive 关联数, 文件记录数)``，删除确认前展示。"""
+    n_archives = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM dataset_archive WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchone()["n"]
+    )
+    n_files = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM file WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchone()["n"]
+    )
+    return n_archives, n_files
+
+
+def archive_usage(conn: sqlite3.Connection, archive_name: str) -> tuple[int, int]:
+    """返回 ``(dataset 数, 文件记录数)``，删除确认前展示。"""
+    n_datasets = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM dataset_archive WHERE archive_name = ?",
+            (archive_name,),
+        ).fetchone()["n"]
+    )
+    n_files = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM file WHERE archive_name = ?",
+            (archive_name,),
+        ).fetchone()["n"]
+    )
+    return n_datasets, n_files
+
+
+def delete_dataset(conn: sqlite3.Connection, name: str) -> dict:
+    """删除一个 Dataset 条目；``dataset_archive`` / ``file`` 记录随外键级联删除。
+
+    只动目录库：磁带上的数据是只读的，不会被触碰。删除后该 Dataset 的
+    文件会被视为未归档——对同一来源重新备份会整包重新写入（磁带上出现
+    重复数据），调用方务必先向操作员确认。
+
+    Returns:
+        ``{"name", "archives", "files"}``：删除时的关联/文件计数。
+    """
+    row = get_dataset(conn, name)
+    if row is None:
+        raise KeyError(f"目录库中没有 Dataset {name!r}")
+    ds_id = int(row["id"])
+    n_archives, n_files = dataset_usage(conn, ds_id)
+    with transaction(conn):
+        conn.execute("DELETE FROM dataset WHERE id = ?", (ds_id,))
+    return {"name": name, "archives": n_archives, "files": n_files}
+
+
+def delete_archive(conn: sqlite3.Connection, name: str) -> dict:
+    """删除一个 Archive 条目；``dataset_archive`` / ``file`` 记录随外键级联删除。
+
+    混装多个 Dataset 的 archive 会连带删掉其它 Dataset 在本包内的文件
+    记录。同时把所在磁带的 ``archive_count`` 减一（减到 0 后该磁带条目
+    可用 :func:`delete_tape` 另行删除）。
+
+    Returns:
+        ``{"name", "tape_label", "datasets", "files"}``。
+    """
+    row = get_archive(conn, name)
+    if row is None:
+        raise KeyError(f"目录库中没有 archive {name!r}")
+    tape_label = str(row["tape_label"])
+    n_datasets, n_files = archive_usage(conn, name)
+    with transaction(conn):
+        conn.execute("DELETE FROM archive WHERE name = ?", (name,))
+        conn.execute(
+            "UPDATE tape SET archive_count = MAX(archive_count - 1, 0) "
+            "WHERE label = ?",
+            (tape_label,),
+        )
+    return {
+        "name": name,
+        "tape_label": tape_label,
+        "datasets": n_datasets,
+        "files": n_files,
+    }
+
+
+def delete_tape(conn: sqlite3.Connection, label: str) -> dict:
+    """删除一个 Tape 条目。磁带上仍有 archive 记录时拒绝。
+
+    Returns:
+        ``{"name"}``。
+    """
+    if get_tape(conn, label) is None:
+        raise KeyError(f"目录库中没有磁带 {label!r}")
+    n = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM archive WHERE tape_label = ?", (label,)
+        ).fetchone()["n"]
+    )
+    if n:
+        raise RuntimeError(
+            f"磁带 {label} 上仍有 {n} 个 archive 记录，不能直接删除；"
+            "请先删除对应的 archive 条目。"
+        )
+    with transaction(conn):
+        conn.execute("DELETE FROM tape WHERE label = ?", (label,))
+    return {"name": label}
+
+
 # --- display helpers ----------------------------------------------------------
 
 
